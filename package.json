@@ -1,6 +1,6 @@
 {
   "name": "dsh-goal-loop",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "module",
   "description": "目标工程三层闸门 for DeepSeek Harness：机器层（命令能判的全绿）+ 评审层（独立判分过线、无红线）+ 校准层（盲预测押注、判完对账、换尺子留理由）。",
   "main": "./index.mjs",

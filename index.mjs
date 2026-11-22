@@ -409,11 +409,33 @@ function resolveRubric(args, cwd) {
 /**
  * @param {object} ctx Cordis 上下文
  */
-export function apply(ctx) {
+/**
+ * 插件配置：这一版把「常驻提示」与「技能/命令」做成可关的。
+ *
+ * 为什么要开关：常驻政策段每轮都进系统提示，它换来的是「不用记得加载技能」；
+ * 如果你只在偶尔做交付时才用这套东西，天天带着一段规则是浪费。
+ * 关掉之后工具仍在、skill goal-loop 仍可手动加载，只是不再自动进提示。
+ *
+ * 在 profile 的 cordis.patch.yml 里改：
+ *   - id: dsh-goal-loop
+ *     config: { policy: false }
+ * 三个键都可省略，缺省全开；写 false 才关。
+ * 不声明 schemastery 的 Config：这个插件装在 profile 之外的工作树里，
+ * 真实路径解析链上拿不到 @deepseek-ai/schemastery，声明了反而会让整插件加载失败。
+ */
+export const CONFIG_KEYS = ['policy', 'skills', 'commands'];
+
+/**
+ * 挂载入口。
+ * @param {object} ctx Cordis 上下文
+ * @param {object} config 插件配置（缺省时三项全开）
+ */
+export function apply(ctx, config = {}) {
   const log = (msg) => ctx.logger?.warn?.(`dsh-goal-loop: ${msg}`);
+  const on = (key) => config?.[key] !== false;
 
   // 0) 常驻政策段：三层闸门不靠"记得加载技能"，直接进系统提示。
-  if (typeof ctx.inject === 'function') {
+  if (on('policy') && typeof ctx.inject === 'function') {
     ctx.inject(['systemPrompt'], (promptCtx) => {
       const systemPrompt = serviceOf(promptCtx, 'systemPrompt');
       if (typeof systemPrompt?.section !== 'function') return;
@@ -434,7 +456,7 @@ export function apply(ctx) {
   }
 
   // 1) 行为协议：主技能 + 三个角色稿
-  if (typeof ctx.inject === 'function') {
+  if (on('skills') && typeof ctx.inject === 'function') {
     ctx.inject(['skills'], (skillCtx) => {
       const skills = serviceOf(skillCtx, 'skills');
       if (typeof skills?.register !== 'function') return;
@@ -480,7 +502,7 @@ export function apply(ctx) {
   }
 
   // 2) 斜杠命令
-  if (typeof ctx.inject === 'function') {
+  if (on('commands') && typeof ctx.inject === 'function') {
     ctx.inject(['commands'], (commandCtx) => {
       const commands = serviceOf(commandCtx, 'commands');
       if (typeof commands?.register !== 'function') return;

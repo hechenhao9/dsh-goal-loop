@@ -93,6 +93,22 @@ test('apply 注册常驻政策段到 systemPrompt', () => {
   assert.ok(sections[0].text.length < 1200, `政策段每轮付费，必须压短（当前 ${sections[0].text.length} 字）`);
 });
 
+test('config.policy=false 时不注册常驻政策段，工具照常注册', () => {
+  const { ctx, sections, tools } = fakeCtx();
+  apply(ctx, { policy: false });
+  assert.equal(sections.length, 0, '关掉开关就不该每轮为提示付费');
+  assert.equal(tools.length, 8, '关开关只影响提示，不卸载工具');
+});
+
+test('config.skills=false / commands=false 只影响对应层', () => {
+  const { ctx, skills, commands, sections, tools } = fakeCtx();
+  apply(ctx, { skills: false, commands: false });
+  assert.equal(sections.length, 1, '政策段没关');
+  assert.equal(skills.length, 0, '技能被关');
+  assert.equal(commands.length, 0, '命令被关');
+  assert.equal(tools.length, 8, '工具不受影响');
+});
+
 test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', () => {
   const tools = [];
   const ctx = {
