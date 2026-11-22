@@ -18,11 +18,14 @@
  *   扣分是否落成了「把 X 改成 Y」（说不清怎么改的扣分不算数）；
  *   红线是否命中（命中则分数再高也不许交）。
  *
- * 四个工具：
- *   goal_define   编译合约（含 rubric），不合格直接拒收，不落盘。
- *   goal_check    真跑机器层，落 proof-<n>.json。
- *   goal_review   提交判分，机器审计后落 review-<n>.json。
- *   goal_verdict  读盘上最近的 proof 与 review，给唯一裁决，落 gate.json。
+ * 八个工具：
+ *   goal_define   编译合约（含 rubric / 代价台账 / 拒绝清单），不合格直接拒收，不落盘；dry_run 只验不落。
+ *   goal_check    真跑机器层，落 proof-<n>.json；only 参数用于调试单条。
+ *   goal_review   提交判分，机器审计后落 review-<n>.json，同时写 review-brief.json（判分任务书）。
+ *   goal_predict  判分前押注，封条不可改。
+ *   goal_retro    判完对账，记偏差方向与命中率。
+ *   goal_verdict  读盘上最近的 proof / review / retro，给唯一裁决，落 gate.json。
+ *   goal_doctor   一次体检全部目标：卡在哪、下一步敲哪个工具。
  *   goal_status   台账总览。
  *
  * 一个技能（skill/goal-loop.md）+ 三个角色稿（agents/{professor,tutor,reviewer}.md）+ 两个命令。
@@ -39,6 +42,7 @@ import {
   summarize,
   renderReport,
   verdictLine,
+  nextStep,
 } from './lib/goal-core.mjs';
 import {
   saveContract,
@@ -105,6 +109,9 @@ const POLICY_SECTION = [
   '3) 有 rubric 的任务，判分必须由独立一方给（自己写的稿子自己打分不算），交 goal_review 让机器审计：引文逐字对、分数重算、扣分要能落成改法、命中红线即废。',
   '4) 说"完成／做好了／可以了"之前必须 goal_verdict 的 deliverable=true。没过就如实说差哪条、卡在哪。',
   '5) 有 rubric 的任务，判分之前先 goal_predict 押注（每维押 0/4/7/10 + 总分区间 + 依据），封了不可改；判完 goal_retro 对账。连续三轮同向偏差＝错的是标准不是稿子，改 criterion 并给 rubric_change_reason，旧分作废重判。',
+  '6) 说「借鉴／参考／复刻／移植」就必须给 provenance：source（抄的是哪个仓库哪个版本）+ paid_for（对方为这设计付过什么代价：哪次事故、哪次回退、哪个被拒的 PR）+ kept（我们保留或改了什么）。抄想法只抄到壳，抄代价才抄到骨头——没有代价记录的借鉴一律按抄壳处理。确实无代价可抄时用 provenance_waived + 理由，别静默跳过。',
+  '   同时写 refusals：哪些要求会被提出来、为什么拒、怎么答。写下来的拒绝，下一轮才不会被重新提一遍。',
+  '不知道卡在哪就 goal_doctor：它把每个目标的问题与下一步该敲的工具一起列出来。',
   '不建合约：纯问答、单点排错、闲聊——直接答，别为建合约而建合约。',
 ].join('\n');
 
@@ -240,6 +247,39 @@ const defineParameters = {
     rubric_file: { type: 'string', description: '也可以给一份 rubric.json 的路径（相对工作区），由教授角色产出。' },
     constraints: { type: 'array', items: { type: 'string' }, description: '硬约束（不许动的东西、必须用的技术、时间）。' },
     non_goals: { type: 'array', items: { type: 'string' }, description: '明确不做的事——挡住范围膨胀。' },
+    provenance: {
+      type: 'array',
+      description: '代价台账：这份交付借鉴/复刻了谁，对方为这个设计付过什么代价。合约里只要出现「借鉴/参考/复刻/移植/抄」就必填（否则拒收）。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['source', 'paid_for', 'kept'],
+        properties: {
+          id: { type: 'string' },
+          source: { type: 'string', description: '从哪抄的：仓库/文件/版本/链接。写「某个开源项目」等于没写。' },
+          paid_for: { type: 'string', description: '≥12 字且含可查线索：对方踩过的坑、回退过的版本、被拒的 PR、为什么把阈值定在这里。' },
+          kept: { type: 'string', description: '≥8 字：我们保留哪一条，或改了什么、为什么改。' },
+        },
+      },
+    },
+    refusals: {
+      type: 'array',
+      description: '拒绝清单：有人会提出的那种要求 + 为什么拒 + 怎么答。写下来的拒绝，下一轮才不会被重新提一遍。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ask', 'why'],
+        properties: {
+          id: { type: 'string' },
+          ask: { type: 'string', description: '对方会说的那句话，如「把阈值降一点让这次过」。' },
+          why: { type: 'string', description: '≥10 字：为什么不能答应。' },
+          reply: { type: 'string', description: '直接怎么回他（可省，省了下次得重新想措辞）。' },
+        },
+      },
+    },
+    provenance_waived: { type: 'boolean', description: '确实没有可抄的代价时置 true，并给 provenance_waiver_reason。这是显式声明，不是静默跳过。' },
+    provenance_waiver_reason: { type: 'string', description: '≥12 字：为什么这次不需要代价台账（全新设计、无先例、或借鉴对象没有公开的代价记录）。' },
+    dry_run: { type: 'boolean', description: '只校验不落盘：拿来看「这份合约还差什么」，不会产生台账、不会递增 revision。' },
     budget: {
       type: 'object',
       additionalProperties: false,
@@ -509,6 +549,17 @@ export function apply(ctx) {
           errors: { type: 'array', items: { type: 'string' }, description: '必须修掉的硬错误。' },
           warnings: { type: 'array', items: { type: 'string' }, description: '不会拦下但会削弱验收的提醒。' },
           gated: { type: 'boolean', description: '是否有评审层（rubric）。' },
+          dry_run: { type: 'boolean', description: '本次只校验未落盘。' },
+          counts: {
+            type: 'object',
+            description: '合约体量：机器验收条数、评审维数、代价台账条数、拒绝清单条数。',
+            properties: {
+              done_when: { type: 'number' },
+              dims: { type: 'number' },
+              provenance: { type: 'number' },
+              refusals: { type: 'number' },
+            },
+          },
           message: { type: 'string' },
         },
       },
@@ -545,6 +596,10 @@ export function apply(ctx) {
           done_when: args.done_when,
           constraints: args.constraints,
           non_goals: args.non_goals,
+          provenance: args.provenance,
+          refusals: args.refusals,
+          provenance_waived: args.provenance_waived,
+          provenance_waiver_reason: args.provenance_waiver_reason,
           budget: args.budget,
           created_at: prev?.created_at,
           status: prev?.status ?? 'open',
@@ -568,6 +623,30 @@ export function apply(ctx) {
         warnings.push(...change.warnings);
       }
 
+      const counts = {
+        done_when: contract.done_when.length,
+        dims: rubric?.dims?.length ?? 0,
+        provenance: contract.provenance.length,
+        refusals: contract.refusals.length,
+      };
+
+      // dry run：只回答"还差什么"，不产生任何台账。
+      if (args.dry_run === true) {
+        return {
+          ok: errors.length === 0,
+          id: contract.id,
+          dir: goalDir(cwd, contract.id),
+          errors,
+          warnings,
+          gated,
+          dry_run: true,
+          counts,
+          message: errors.length
+            ? `dry run：还差 ${errors.length} 项——${errors[0]}`
+            : `dry run 通过：${counts.done_when} 条机器验收 + ${counts.dims} 维评审 + ${counts.provenance} 条代价台账 + ${counts.refusals} 条拒绝清单。未落盘；确认没问题就去掉 dry_run 再调一次。`,
+        };
+      }
+
       if (errors.length) {
         return {
           ok: false,
@@ -576,6 +655,8 @@ export function apply(ctx) {
           errors,
           warnings,
           gated,
+          dry_run: false,
+          counts,
           message: `合约被拒收（${errors.length} 项）：${errors[0]} 修完再调 goal_define。`,
         };
       }
@@ -601,9 +682,11 @@ export function apply(ctx) {
         errors: [],
         warnings,
         gated,
+        dry_run: false,
+        counts,
         message: gated
-          ? `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收 + ${rubric.dims.length} 维评审，合格线 ${rubric.bar}）。下一步：先 goal_predict 押注，再动手，然后 goal_check。${changeNote}`
-          : `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收，无评审层）。下一步动手，然后 goal_check。${changeNote}`,
+          ? `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收 + ${rubric.dims.length} 维评审，合格线 ${rubric.bar}${counts.provenance ? `，${counts.provenance} 条代价台账` : ''}${counts.refusals ? `，${counts.refusals} 条拒绝清单` : ''}）。下一步：先 goal_predict 押注，再动手，然后 goal_check。${changeNote}`
+          : `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收，无评审层${counts.provenance ? `，${counts.provenance} 条代价台账` : ''}${counts.refusals ? `，${counts.refusals} 条拒绝清单` : ''}）。下一步动手，然后 goal_check。${changeNote}`,
       };
     },
   });
@@ -768,6 +851,10 @@ export function apply(ctx) {
           `.goal/${contract.id}/proof-*.json`,
         ],
         note: '判分人只读 must_read 里的作品与 rubric。看过历史分数或预测，判断就从独立评审退化成对答案的拟合。',
+        // 边界也是判据的一部分：判分人要能看见「这份东西明确不做什么、哪些要求已经被拒过」。
+        non_goals: contract.non_goals ?? [],
+        refusals: contract.refusals ?? [],
+        provenance: contract.provenance ?? [],
         generated_at: new Date().toISOString(),
       };
       const briefFile = await saveReviewBrief(cwd, contract, brief);
@@ -1045,7 +1132,107 @@ export function apply(ctx) {
     },
   });
 
-  // 9) goal_status
+  // 9) goal_doctor：一次体检全部目标，直接给出下一步该敲哪个工具
+  ctx.tools.register({
+    name: 'goal_doctor',
+    description:
+      '一次体检台账里所有目标：机器层红不红、判分有没有、判据换过没有、押注对账了没有、偏差是否连续同向、预算是否用满、代价台账与拒绝清单写没写，并把「下一步该敲哪个工具」直接给出来。不知道卡在哪，或者收工前想确认一遍，先跑它。',
+    parameters: verdictParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'healthy', 'checked', 'problems', 'message'],
+        properties: {
+          ok: { type: 'boolean' },
+          healthy: { type: 'number', description: '没有任何待处理项的目标数。' },
+          checked: { type: 'number', description: '本次体检的目标总数。' },
+          problems: {
+            type: 'array',
+            description: '每个待处理目标：flags 是问题清单，next 是下一步该敲的工具。',
+            items: { type: 'object', additionalProperties: true },
+          },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const only = String(args.id ?? '').trim();
+      let goals = await listGoals(cwd);
+      if (only) goals = goals.filter((g) => g.id === only);
+      if (goals.length === 0) {
+        return {
+          ok: true,
+          healthy: 0,
+          checked: 0,
+          problems: [],
+          message: only ? `没有这个目标：${only}` : '台账为空：还没有目标合约。用 goal_define 建一份再开工。',
+        };
+      }
+
+      const problems = [];
+      let healthy = 0;
+      for (const g of goals) {
+        const c = await loadContract(cwd, g.id).catch(() => null);
+        if (!c) continue;
+        const reviewRec = await loadLatestReview(cwd, g.id).catch(() => null);
+        const pred = await loadLatestPrediction(cwd, g.id).catch(() => null);
+        const retros = await listRetros(cwd, g.id).catch(() => []);
+        const streak = biasStreak(retros);
+        const next = nextStep({
+          contract: c,
+          proof: { round: g.last_round ?? 0, summary: g.last_summary ?? null },
+          review: reviewRec,
+          pred,
+          retros,
+        });
+        const gated = Boolean(c.rubric?.dims?.length);
+        const bar = Number(c.rubric?.bar ?? 95);
+        const flags = [];
+        if (!gated) flags.push('只有机器层：没有 rubric，交付质量没人判');
+        if (!g.last_summary) flags.push('从未跑过 goal_check');
+        else if (g.last_summary.fail > 0 || g.last_summary.unknown > 0) {
+          flags.push(`机器层未绿：fail ${g.last_summary.fail} / unknown ${g.last_summary.unknown}`);
+        }
+        if (gated && !pred && g.last_summary?.fail === 0) flags.push('还没押注：判分前先 goal_predict');
+        if (gated && pred && (!retros.length || Number(retros.at(-1)?.round ?? 0) < Number(pred.round ?? 0))) {
+          flags.push('押了没对账：goal_retro');
+        }
+        if (reviewRec?.stale) flags.push('判分已 stale：判据换过，要重判');
+        const total = reviewRec?.audited?.total;
+        if (gated && reviewRec && !reviewRec.stale && typeof total === 'number' && total < bar) {
+          flags.push(`差 ${Math.round((bar - total) * 100) / 100} 分到合格线`);
+        }
+        if (streak.warn) flags.push(`连续 ${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}：该改的是 criterion`);
+        if ((c.provenance?.length ?? 0) === 0) flags.push('没有代价台账：借鉴了谁、对方付过什么代价没写');
+        if ((c.refusals?.length ?? 0) === 0) flags.push('没有拒绝清单：边界没落成文字');
+        if (next.blocked) flags.push('预算已用满：该写 BLOCKED');
+        if (flags.length === 0) {
+          healthy += 1;
+          continue;
+        }
+        problems.push({ id: g.id, status: g.status, objective: g.objective, flags, next });
+      }
+
+      const lines = problems.length
+        ? problems.map((p) => `- ${p.id} [${p.status}] ${p.objective}\n    ${p.flags.join('；')}\n    → ${p.next.tool ? `${p.next.tool}：${p.next.why}` : p.next.why}`)
+        : ['（没有待处理项）'];
+      return {
+        ok: true,
+        healthy,
+        checked: goals.length,
+        problems,
+        message: [
+          `体检 ${goals.length} 个目标：${healthy} 个无需处理，${problems.length} 个要动。`,
+          ...lines,
+        ].join('\n'),
+      };
+    },
+  });
+
+  // 10) goal_status
   ctx.tools.register({
     name: 'goal_status',
     description:
@@ -1083,6 +1270,13 @@ export function apply(ctx) {
             ? `${retros.length ? retroLine(retros.at(-1)) : '已押注未对账'}${streak.warn ? `［连续 ${streak.streak} 轮同向，该改标准］` : ''}`
             : '未押注（下一轮判分前先 goal_predict）';
         const staleCount = reviewRec?.stale ? 1 : 0;
+        const next = nextStep({
+          contract: c,
+          proof: { round: goals[0]?.last_round ?? 0, summary: goals[0]?.last_summary ?? null },
+          review: reviewRec,
+          pred,
+          retros,
+        });
         return {
           ok: true,
           goals: [{
@@ -1093,9 +1287,10 @@ export function apply(ctx) {
             review_total: total,
             calibration: { predicted: Boolean(pred), retro_rounds: retros.length, bias: retros.at(-1)?.bias ?? null, streak },
             review_stale: Boolean(reviewRec?.stale),
+            next,
             ...(goals[0] ?? {}),
           }],
-          message: `${c.id}：${c.objective}（机器层 ${c.done_when.length} 条，最近一轮 ${describeProof(goals[0])}${gated ? `；评审层 ${c.rubric.dims.length} 维，合格线 ${bar}，最近判分 ${total === null ? '未判' : total}${staleCount ? '（已标 stale，判据换过）' : ''}；校准 ${calib}` : '；无评审层'}）`,
+          message: `${c.id}：${c.objective}（机器层 ${c.done_when.length} 条，最近一轮 ${describeProof(goals[0])}${gated ? `；评审层 ${c.rubric.dims.length} 维，合格线 ${bar}，最近判分 ${total === null ? '未判' : total}${staleCount ? '（已标 stale，判据换过）' : ''}；校准 ${calib}` : '；无评审层'}）｜下一步：${next.tool ? `${next.tool}（${next.why}）` : next.why}`,
         };
       }
       const goals = await listGoals(cwd);
@@ -1116,8 +1311,22 @@ export function apply(ctx) {
           calibPart = pred
             ? `｜校准 ${retros.length ? `bias=${retros.at(-1)?.bias ?? 'none'}×${retros.length}` : '已押未对账'}`
             : '｜未押注';
+          const next = nextStep({
+            contract: await loadContract(cwd, g.id).catch(() => ({})),
+            proof: { round: g.last_round ?? 0, summary: g.last_summary ?? null },
+            review: reviewRec,
+            pred,
+            retros,
+          });
+          calibPart += next.tool ? `｜→ ${next.tool}` : '｜→ 停手';
+        } else {
+          const next = nextStep({
+            contract: await loadContract(cwd, g.id).catch(() => ({})),
+            proof: { round: g.last_round ?? 0, summary: g.last_summary ?? null },
+          });
+          calibPart = next.tool ? `｜→ ${next.tool}` : '｜→ 停手';
         }
-        lines.push(`- ${g.id} [${g.status}] ${g.objective} → ${describeProof(g)}${reviewPart}${calibPart}`);
+        lines.push(`- ${g.id} [${g.status}] ${g.objective} → ${describeProof(g)}${reviewPart}${calibPart}${g.provenance ? '' : '｜无代价台账'}`);
       }
       return {
         ok: true,

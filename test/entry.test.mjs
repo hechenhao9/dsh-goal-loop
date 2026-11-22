@@ -57,12 +57,12 @@ test('入口导出形态正确', () => {
   assert.equal(typeof apply, 'function');
 });
 
-test('apply 注册 7 个工具 + 4 技能 + 2 命令', () => {
+test('apply 注册 8 个工具 + 4 技能 + 2 命令', () => {
   const { ctx, tools, skills, commands } = fakeCtx();
   apply(ctx);
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ['goal_check', 'goal_define', 'goal_predict', 'goal_retro', 'goal_review', 'goal_status', 'goal_verdict'],
+    ['goal_check', 'goal_define', 'goal_doctor', 'goal_predict', 'goal_retro', 'goal_review', 'goal_status', 'goal_verdict'],
   );
   for (const t of tools) {
     assert.equal(typeof t.execute, 'function');
@@ -101,7 +101,7 @@ test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', ()
     logger: { warn: () => {} },
   };
   assert.doesNotThrow(() => apply(ctx));
-  assert.equal(tools.length, 7);
+  assert.equal(tools.length, 8);
 });
 
 test('端到端：define(rubric) → check → review → verdict', async () => {

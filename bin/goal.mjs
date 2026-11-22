@@ -2,7 +2,8 @@
 /**
  * goal.mjs — 目标工程双层闸门的命令行入口（不需要 DSH 也能用；也是插件坏掉时的兜底）。
  *
- *   node bin/goal.mjs status                # 台账总览（机器层 + 评审层）
+ *   node bin/goal.mjs status                # 台账总览（机器层 + 评审层 + 下一步）
+ *   node bin/goal.mjs doctor                # 体检全部目标：卡在哪、下一步敲哪个工具
  *   node bin/goal.mjs check [id]            # 真跑机器层，落 proof-N.json
  *   node bin/goal.mjs define <file.json>    # 从 JSON 建/更新合约（含 rubric）
  *   node bin/goal.mjs review <file.json> [id]  # 提交判分，机器审计后落 review-N.json
@@ -15,7 +16,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
-import { normalizeContract, validateContract, runContract, summarize, renderReport, verdictLine } from '../lib/goal-core.mjs';
+import { normalizeContract, validateContract, runContract, summarize, renderReport, verdictLine, nextStep } from '../lib/goal-core.mjs';
 import { saveContract, resolveContract, listGoals, saveProof, setStatus, loadContract } from '../lib/goal-store.mjs';
 import { normalizeRubric, validateRubric, validateReview, decide, decideLine } from '../lib/rubric-core.mjs';
 import {
@@ -68,8 +69,13 @@ async function main() {
           ? `评审 ${g.rubric.dims} 维 ${review?.audited?.total ?? '未判'}/${g.rubric.bar}`
           : '无评审层';
         console.log(`- ${g.id} [${g.status}] ${g.objective}`);
-        console.log(`    机器层 ${g.done_when} 条 · ${tail}｜${reviewTail}`);
+        console.log(`    机器层 ${g.done_when} 条 · ${tail}｜${reviewTail}｜台账 ${g.provenance ?? 0} 代价 / ${g.refusals ?? 0} 拒绝`);
       }
+      return 0;
+    }
+
+    case 'doctor': {
+      console.log(await doctorReport(cwd));
       return 0;
     }
 
@@ -194,7 +200,7 @@ async function main() {
       const streak = biasStreak(retros);
       console.log(retroLine({ ...result, round: predRec.round }));
       if (streak.warn) {
-        console.log(`\n注意：连续 ${streak.count} 轮同向偏差（${streak.direction}）。`);
+        console.log(`\n注意：连续 ${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}——该改的是 criterion，不是继续改稿。`);
         console.log('  这说明标准本身有偏，不是稿子每次都错——改 criterion，并给 rubric_change_reason。');
       }
       console.log(`retro: ${saved.file}`);
@@ -267,6 +273,78 @@ async function main() {
  * 玩具目标，跑完整链路：机器层故意先红一次，修绿；判分先被拒一次（引文编的），
  * 改成逐字引文后过线；最后 verdict 放行。这不是演示动画，是真跑。
  */
+async function doctorReport(root, onlyId) {
+  const goals = await listGoals(root);
+  const picked = onlyId ? goals.filter((g) => g.id === onlyId || g.id.startsWith(onlyId)) : goals;
+  if (picked.length === 0) {
+    return onlyId
+      ? `没有这个目标：${onlyId}（用 status 看现有 id）`
+      : '台账为空：还没有目标合约。用 `node bin/goal.mjs define goal.json` 建一份。';
+  }
+  const lines = [];
+  let healthy = 0;
+  let released = 0;
+  for (const g of picked) {
+    const c = await loadContract(root, g.id).catch(() => null);
+    if (!c) {
+      lines.push(`- ${g.id}: 合约读不出来（goal.json 可能坏了）`);
+      continue;
+    }
+    const review = await loadLatestReview(root, g.id).catch(() => null);
+    const pred = await loadLatestPrediction(root, g.id).catch(() => null);
+    const retros = await listRetros(root, g.id).catch(() => []);
+    const streak = biasStreak(retros);
+    const n = nextStep({
+      contract: c,
+      proof: { round: g.last_round ?? 0, summary: g.last_summary ?? null },
+      review, pred, retros,
+    });
+    const gated = Boolean(c.rubric?.dims?.length);
+    const bar = Number(c.rubric?.bar ?? 95);
+    const total = review?.audited?.total;
+    const flags = [];
+    if (!gated) flags.push('只有机器层：没有 rubric');
+    if (!g.last_summary) flags.push('从未跑过 check');
+    else if (g.last_summary.fail > 0 || g.last_summary.unknown > 0) {
+      flags.push(`机器层未绿：fail ${g.last_summary.fail} / unknown ${g.last_summary.unknown}`);
+    }
+    if (gated && !pred && g.last_summary?.fail === 0 && g.last_summary?.unknown === 0) flags.push('还没押注：判分前先 goal_predict');
+    if (gated && pred && (!retros.length || Number(retros.at(-1)?.round ?? 0) < Number(pred.round ?? 0))) flags.push('押了没对账：goal_retro');
+    if (review?.stale) flags.push('判分已 stale：判据换过，要重判');
+    if (gated && review && !review.stale && typeof total === 'number' && total < bar) {
+      flags.push(`差 ${Math.round((bar - total) * 100) / 100} 分到合格线`);
+    }
+    if (streak.warn) {
+      flags.push(`连续 ${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}：该改 criterion`);
+    }
+    if ((c.provenance?.length ?? 0) === 0) flags.push('没有代价台账');
+    if ((c.refusals?.length ?? 0) === 0) flags.push('没有拒绝清单');
+    if (n.blocked) flags.push('预算已用满：该写 BLOCKED');
+    if (flags.length === 0) {
+      let gate = null;
+      try {
+        gate = JSON.parse(readFileSync(path.join(root, '.goal', g.id, 'gate.json'), 'utf8'));
+      } catch {
+        gate = null;
+      }
+      if (gate?.deliverable) {
+        released += 1;
+        lines.push(`- ${g.id}: 已放行（gate 通过，不用再动）`);
+      } else healthy += 1;
+      continue;
+    }
+    lines.push(`- ${g.id}: ${flags.join('；')}`);
+    lines.push(`    → ${n.tool ? `${n.tool}：${n.why}` : n.why}`);
+  }
+  const needWork = picked.length - healthy - released;
+  const parts = [];
+  if (healthy) parts.push(`${healthy} 个无需处理`);
+  if (released) parts.push(`${released} 个已放行`);
+  parts.push(`${needWork} 个还需处理`);
+  lines.push(`共 ${picked.length} 个目标：${parts.join('，')}。`);
+  return lines.join('\n');
+}
+
 async function demo() {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'goal-loop-demo-'));
   const rel = (p) => path.relative(dir, p) || '.';
@@ -275,9 +353,17 @@ async function demo() {
   const draft = path.join(dir, 'draft.md');
   await writeFile(draft, '# 交付物\n用来演示的样本文件，还没写那句话。\n', 'utf8');
 
+  console.log('⓪ 合约里写了「借鉴」，却没写对方付过什么代价（预期拒收）');
+  const bare = validateContract(normalizeContract({
+    objective: '借鉴 judge-loop 的做法做一个能交的闸门',
+    done_when: [{ claim: 'draft.md 存在', check: 'node -e "process.exit(0)"' }],
+  }, new Date()));
+  for (const e of bare.errors) console.log(`   ✗ ${e}`);
+  console.log('   补上代价台账与拒绝清单后放行（见下面这份合约）\n');
+
   const contract = normalizeContract({
     id: 'demo-loop',
-    objective: '演示双层闸门：机器层先红后绿，评审层先被拒后过线',
+    objective: '演示三层闸门：机器层先红后绿，评审层先被拒后过线',
     done_when: [
       {
         id: 'D1',
@@ -287,6 +373,20 @@ async function demo() {
       },
     ],
     non_goals: ['不联网'],
+    provenance: [
+      {
+        source: 'dsh-judge-loop v2.0.0 的 README 与被砍掉的 gate.cjs',
+        paid_for: '把合格线设成 100 分，结果同一份稿改到第八版还在循环，最后把机械闸门整个砍掉',
+        kept: '合格线设 95，留 5 分给没人看的地方，并且允许低权重维度掉一档',
+      },
+    ],
+    refusals: [
+      {
+        ask: '把合格线从 95 降到 90，让这一版直接过',
+        why: '降合格线是元层级改动，会让所有历史判分与校准记录失去可比性',
+        reply: '不改阈值：要么改 criterion 说清为什么偏高，要么继续改稿',
+      },
+    ],
   }, new Date());
   contract.rubric = normalizeRubric({
     topic: '演示',
@@ -361,7 +461,7 @@ async function demo() {
   console.log(`   ${retroLine({ ...retro, round: predSaved.round })}`);
   const retros = await listRetros(dir, contract.id);
   const streak = biasStreak(retros);
-  console.log(`   连续同向偏差：${streak.warn ? `${streak.count} 轮 ${streak.direction}（该改标准了）` : '无'}`);
+  console.log(`   连续同向偏差：${streak.warn ? `${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}——该改标准了` : `无（${streak.streak} 轮，阈值 ${streak.limit}）`}`);
   console.log(`   retro: ${rel(retroSaved.file)}`);
 
   console.log('\n⑦ 终局裁决');
@@ -374,6 +474,11 @@ async function demo() {
   });
   console.log(`   ${decideLine(verdict)}`);
   console.log(`   gate: ${rel(gated.file)}`);
+
+  console.log('\n⑧ 体检：它自己会告诉你下一步敲哪个工具');
+  const doc = await doctorReport(dir, contract.id);
+  console.log(doc.split('\n').map((l) => `   ${l}`).join('\n'));
+
   console.log(`\n演示目录保留：${dir}\n想看结构：ls -R ${dir}${path.sep}.goal`);
   return verdict.deliverable ? 0 : 1;
 }

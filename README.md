@@ -57,6 +57,28 @@
 
 ---
 
+## 三之二、合约材料：抄作业要写下对方付过的代价
+
+目标里出现「借鉴/参考/复刻/移植/对标」这类词，`goal_define` 会要求两份材料，缺一份就不落盘：
+
+**`provenance` 代价台账**——每条三格，都是必填：
+
+| 字段 | 要写什么 | 为什么必须写 |
+|---|---|---|
+| `source` | 抄的是哪个仓库/哪一版/哪个文件 | 抄壳的人记不住版本，抄骨头的人记得 |
+| `paid_for` | **对方付过什么代价**（哪个 issue、哪次回退、哪个被砍掉的设计） | 只写功能的台账没有信息量；写代价才知道哪条路走过且堵了 |
+| `kept` | 你保留了什么、改了什么，为什么 | 「我也这么做」不是结论，「我为什么还这么做」才是 |
+
+`paid_for` 里没有任何代价线索（issue / commit / 回退 / 阈值 / 被拒 / 事故…）只告警，不拦——但它在提醒你：这一格大概率是空话。
+
+**`refusals` 拒绝清单**——预先写下「什么人会让你破例、你怎么回」。`ask` + `why` 必填，`reply` 可选。它防的不是别人，是三天后的自己。
+
+不想写也行：`provenance_waived: true` + `provenance_waiver_reason`（≥12 字）说明这次为什么没有可抄的代价。**豁免要留理由，沉默不算。**
+
+代价在规则层能验的部分到此为止——它验得了「有没有写」，验不了「写得真不真」。后者仍归评审层（`reviewer` 有一条「边界一起看」）。
+
+---
+
 ## 四、第三层：校准——尺子自己准不准
 
 前两层验的是「东西对不对」。这一层验的是**标准对不对**。
@@ -94,7 +116,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 - 常驻行为协议 `goal-loop`（不用点名，模型自己在该建合约时会建）
 - 三个角色稿：`goal-professor`（只定标准，不看稿）/ `goal-tutor`（按标准做到位）/ `goal-reviewer`（独立判分）
-- 7 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_status`
+- 8 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_doctor`、`goal_status`
 - 2 个命令：`/goal`、`/review`
 
 ### 不开 DSH 也能用（CLI 兜底）
@@ -107,8 +129,19 @@ node bin/goal.mjs predict predict.json              # 判分前押注（封了�
 node bin/goal.mjs review review-1.json              # 提交判分，机器审计
 node bin/goal.mjs retro                             # 判完对账：尺子偏高还是偏低
 node bin/goal.mjs verdict                           # 终局：0=可以交 1=不许交
+node bin/goal.mjs doctor                            # 体检：卡在哪、下一步敲哪个
 node bin/goal.mjs status                            # 台账总览
 ```
+
+**不知道下一步干什么时，先跑 `doctor`。** 它逐个目标列出「缺 rubric / 从未 check / 机器层未绿 / 还没押注 / 押了没对账 / 判分 stale / 差分到合格线 / 连续高估 / 没有代价台账 / 预算用满」，每行末尾直接给要敲的工具。
+
+`goal_define` 支持三件省事的：
+
+- `dry_run: true`——只校验不落盘。**先 dry run 一遍看还差什么，比落盘后再改快**（尤其在改 rubric 时，改了就会把旧判分标 stale）。
+- 内联 `rubric` 或 `rubric_file: "rubric.json"`（相对合约目录）。
+- 同一 `id` 再调一次就是更新，`revision` 自增；改 rubric 必须带 `rubric_change_reason`。
+
+`goal_check` 支持 `only: ["D2"]`——只重跑某几条（改一处时不必整轮重跑，但**汇报完成前必须无 only 跑满**）。
 
 ---
 
@@ -147,13 +180,27 @@ node bin/goal.mjs status                            # 台账总览
         "fail_example": "只写「增长约三成」没有出处",
         "intent": "防的是把估数写成实测", "vision": "老板随手一抽能对上线"
       },
-      { "id": "M2", "name": "可执行", "weight": 25, "criterion": "report.md 第 3 节给出下季度三条动作，每条有负责人和首周动作", "pass_example": "三条都带人名和日期", "fail_example": "只有方向没有人和时间", "intent": "防的是读完不知道明天干什么", "vision": "照着就能排下周会" },
-      { "id": "M3", "name": "边界", "weight": 25, "criterion": "report.md 写明本季度没做到的两件事及原因", "pass_example": "两件失败项各带一句原因", "fail_example": "只报喜", "intent": "防的是选择性汇报", "vision": "坏消息也在里面" },
-      { "id": "M4", "name": "语气", "weight": 20, "criterion": "report.md 每节首句是结论，没有铺垫段", "pass_example": "首句即结论", "fail_example": "开头两段讲背景", "intent": "防的是 AI 腔", "vision": "读两行知道结论" }
+      { "id": "M2", "name": "可执行", "weight": 25, "criterion": "report.md 第 3 节给出下季度三条动作，每条有负责人和首周动作", "pass_example": "三条动作都带人名和日期", "fail_example": "只有方向没有人和时间", "intent": "防的是读完不知道明天干什么", "vision": "照着就能排出下周的会" },
+      { "id": "M3", "name": "边界", "weight": 25, "criterion": "report.md 写明本季度没做到的两件事及原因", "pass_example": "两件没做到的事各带一句原因", "fail_example": "只报喜不报忧，读者以为一路顺", "intent": "防的是选择性汇报", "vision": "坏消息也在里面，且说清为什么" },
+      { "id": "M4", "name": "语气", "weight": 20, "criterion": "report.md 每节首句是结论，没有铺垫段", "pass_example": "每节首句就是结论，能直接引用", "fail_example": "开头两段都在讲背景和行业大势", "intent": "防的是 AI 腔铺垫", "vision": "读两行就知道这份复盘想说什么" }
     ],
     "vetoes": [{ "id": "V1", "name": "数字编造", "why": "一个编的数字会让整份复盘不可信" }]
   },
-  "non_goals": ["不做竞品分析"]
+  "non_goals": ["不做竞品分析"],
+  "provenance": [
+    {
+      "source": "dsh-judge-loop v2.0.0 的 gate.cjs 与它的 README",
+      "paid_for": "把闸门门槛设成 100 分，同一份稿改到第八版还在 96–99 循环，最后整个 gate 被砍掉",
+      "kept": "合格线降到 95，机器只验能验的事，好坏留给人判"
+    }
+  ],
+  "refusals": [
+    {
+      "ask": "这版就差 0.5 分，把 bar 从 95 改成 92 吧",
+      "why": "改 bar 是元层级改动，会让之前所有判分与校准记录失去可比性",
+      "reply": "不改 bar：改 criterion 说清为什么偏高，或继续改稿"
+    }
+  ]
 }
 ```
 
@@ -178,14 +225,20 @@ node bin/goal.mjs status                            # 台账总览
 ## 八、红灯驱动，不是绿灯驱动
 
 ```
-goal_define（不合格直接拒收，不落盘）
+goal_define（不合格直接拒收，不落盘；dry_run 可只验不写）
    ↓
 goal_check（机器层：绿了才往下走；红了几条就只修这几条）
    ↓
+goal_predict（判分前押注，封了不可改）
+   ↓
 goal_review（判分文件：机器核引文/算术/扣分项/盖章人，拒收就重判）
+   ↓
+goal_retro（对账：尺子偏高还是偏低）
    ↓
 goal_verdict（两层合判：机器全绿 && 评审过线 && 无红线 → 可以交）
 ```
+
+**卡住就看 `goal_doctor`**：它把「卡在哪一步」翻译成「敲哪个工具」，不用自己复盘整条链。
 
 规矩三条：
 
@@ -214,6 +267,7 @@ goal_verdict（两层合判：机器全绿 && 评审过线 && 无红线 → 可�
 - **红线靠人识别。** 机器只能核你写进 `vetoes_hit` 的东西，不会自己发现「这句是编的」。
 - **校准层不重判历史样本。** 换尺子之后旧分标 `stale`，要不要重打分是本插件刻意不做的事——它只保证新分不会被误当成与旧分可比。
 - **预测可以押得敷衍。** 机器能核「有没有押、押得全不全、和实际差多少」，核不了「押的时候是不是真在想」。连续偏差会暴露敷衍，但那已经晚了三轮。
+- **代价台账靠词表识「借鉴」。** 目标是「参考/借鉴/复刻/移植/对标/fork」才触发强制；换个说法（「站在 X 肩膀上」）就绕过去了。它挡的是随手抄，不是有心绕。`paid_for` 真不真、`kept` 有没有道理，机器判不了，仍归评审。
 
 ---
 
