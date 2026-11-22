@@ -1,0 +1,68 @@
+{
+  "_说明": "示例：一份「技术选型方案」的完整合约。机器层验能不能跑通，评审层验值不值得信。可直接 `node bin/goal.mjs define rubric.example.json` 试跑（先把 done_when 里的文件名改成你真实存在的文件）。",
+  "objective": "为团队写一份数据库选型方案，说清为什么选它、什么情况下不选它",
+  "done_when": [
+    {
+      "claim": "方案文件存在且正文超 1200 字",
+      "check": "node -e \"const s=require('fs').readFileSync('selection.md','utf8');process.exit(s.replace(/\\s/g,'').length>1200?0:1)\"",
+      "expect": { "kind": "exit", "value": 0 }
+    },
+    {
+      "claim": "文件里至少有 1 个可执行代码块",
+      "check": "node -e \"const s=require('fs').readFileSync('selection.md','utf8');process.exit(/```(bash|sh|powershell)/.test(s)?0:1)\"",
+      "expect": { "kind": "exit", "value": 0 }
+    }
+  ],
+  "rubric": {
+    "topic": "数据库选型方案",
+    "bar": 95,
+    "dims": [
+      {
+        "id": "M1",
+        "name": "数字有出处",
+        "weight": 30,
+        "criterion": "selection.md 里每个性能数字（QPS/延迟/存储）后面标了测试环境与采集日期，能被抽查",
+        "pass_example": "每个数字后写（本机 i7-12700 / 2026-11-20 实测）",
+        "fail_example": "写「读性能提升约 3 倍」而不说是谁测的",
+        "intent": "防的是把厂商白皮书数字当自己实测",
+        "vision": "随便挑一个数字，都能翻回哪台机器哪天跑的"
+      },
+      {
+        "id": "M2",
+        "name": "反面条件",
+        "weight": 25,
+        "criterion": "selection.md 第 4 节写明「什么情况下不该选它」，至少两条具体到数据量与团队规模",
+        "pass_example": "日增数据超 2000 万行、团队无人会运维时不要选",
+        "fail_example": "只写优点，缺点一笔带过「有一定学习成本」",
+        "intent": "防的是只给结论不给撤销条件",
+        "vision": "读完知道什么时候该反悔"
+      },
+      {
+        "id": "M3",
+        "name": "可执行",
+        "weight": 25,
+        "criterion": "selection.md 的验证段落给出能直接粘贴运行的命令，含端口与环境变量",
+        "pass_example": "docker run 那行带 -p 5432:5432 与 POSTGRES_PASSWORD",
+        "fail_example": "写「按官方文档启动即可」",
+        "intent": "防的是读者还得自己补参数",
+        "vision": "照抄就能起来一个实例"
+      },
+      {
+        "id": "M4",
+        "name": "结论先行",
+        "weight": 20,
+        "criterion": "selection.md 第一段就给出选哪个，不铺垫行业背景",
+        "pass_example": "首句：建议选 PostgreSQL 16，理由是下面三条",
+        "fail_example": "开头两段讲数据库发展史",
+        "intent": "防的是 AI 腔铺垫",
+        "vision": "读第一行就知道结论"
+      }
+    ],
+    "vetoes": [
+      { "id": "V1", "name": "数字编造", "why": "一个凭空写的 QPS 会让整份选型无法复核" },
+      { "id": "V2", "name": "隐藏利益", "why": "拿了厂商支持却不在方案里说明，等于误导决策" }
+    ]
+  },
+  "non_goals": ["不做成本测算", "不做迁移脚本"],
+  "constraints": ["只用团队现有栈里已有的语言", "不引入需要商业授权的组件"]
+}

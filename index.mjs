@@ -1,0 +1,790 @@
+/**
+ * dsh-goal-loop — 目标工程 × 双团队评审，双层闸门。
+ *
+ * 上一代 dsh-goal-engineering 解决「机器能验的部分」：一条命令，0/1，全绿才算完成。
+ * dsh-judge-loop 解决「机器验不了的部分」：标准由不看稿的人写，判分由不是作者的人给。
+ * 两者各自都缺一半：
+ *   - 只有机器层：文件在不在能验，"这份东西配不配发出去"验不了；
+ *   - 只有评审层：分数是人报的，报多少是多少，没人查引文真假、没人算权重对不对。
+ *
+ * 这一代把两半焊在一起：
+ *   一份合约（.goal/<id>/goal.json）同时装 done_when（机器层）与 rubric（评审层）。
+ *   放行判据 deliverable = 机器全绿 &&（无 rubric ? true : 评审过线且无红线）。
+ *
+ * 真正的增量是「机器替人审计判分过程」——人只做那个判断：这句话好不好。
+ *   引文是否逐字存在于被评审的文件里（找不到即判分作废）；
+ *   分数是否只落在 0/4/7/10 四档；
+ *   总分是否等于按权重重算的结果（手报的数不采信）；
+ *   扣分是否落成了「把 X 改成 Y」（说不清怎么改的扣分不算数）；
+ *   红线是否命中（命中则分数再高也不许交）。
+ *
+ * 四个工具：
+ *   goal_define   编译合约（含 rubric），不合格直接拒收，不落盘。
+ *   goal_check    真跑机器层，落 proof-<n>.json。
+ *   goal_review   提交判分，机器审计后落 review-<n>.json。
+ *   goal_verdict  读盘上最近的 proof 与 review，给唯一裁决，落 gate.json。
+ *   goal_status   台账总览。
+ *
+ * 一个技能（skill/goal-loop.md）+ 三个角色稿（agents/{professor,tutor,reviewer}.md）+ 两个命令。
+ * 只消费公开服务（tools / skills / commands / systemPrompt / workingDirectory），随 Fiber 拆除。
+ */
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { readFileSync, existsSync } from 'node:fs';
+import {
+  normalizeContract,
+  validateContract,
+  runContract,
+  summarize,
+  renderReport,
+  verdictLine,
+} from './lib/goal-core.mjs';
+import {
+  saveContract,
+  loadContract,
+  resolveContract,
+  listGoals,
+  saveProof,
+  setStatus,
+  goalDir,
+} from './lib/goal-store.mjs';
+import {
+  normalizeRubric,
+  validateRubric,
+  validateReview,
+  decide,
+  decideLine,
+  DEFAULT_BAR,
+} from './lib/rubric-core.mjs';
+import {
+  saveReview,
+  loadLatestReview,
+  loadLatestProof,
+  saveGate,
+  reviewDir,
+} from './lib/review-store.mjs';
+
+/** Cordis 插件名。 */
+export const name = 'dsh-goal-loop';
+
+/** 工具注册所需服务。 */
+export const inject = ['tools'];
+
+const SKILL_NAME = 'goal-loop';
+const SKILL_FILE = fileURLToPath(new URL('./skill/goal-loop.md', import.meta.url));
+const AGENT_DIR = fileURLToPath(new URL('./agents/', import.meta.url));
+
+/**
+ * 常驻行为层：写进系统提示，不赌"模型会记得去加载技能"。
+ * 刻意压短——它每一轮都要付费，只留判断权归属与最硬的四条。
+ */
+const POLICY_SECTION = [
+  '【目标工程 · 双层闸门】判断权不归我：能不能交，不由我说。',
+  '1) 交付类任务动手之前先 goal_define：objective（交付什么、给谁、什么规模）+ done_when（每条一个能真跑的命令）+ non_goals。',
+  '   判不了好坏的质量维度另写 rubric（4–6 维、权重合计 100、每维有正反例、至少一条红线）。合约被拒收＝目标还不可验收，补全再落，不许"先干着看"。',
+  '2) 动手，然后 goal_check 真跑；红灯只修红灯列出的那几条，修完必须重跑，不许换题。',
+  '3) 有 rubric 的任务，判分必须由独立一方给（自己写的稿子自己打分不算），交 goal_review 让机器审计：引文逐字对、分数重算、扣分要能落成改法、命中红线即废。',
+  '4) 说"完成／做好了／可以了"之前必须 goal_verdict 的 deliverable=true。没过就如实说差哪条、卡在哪。',
+  '不建合约：纯问答、单点排错、闲聊——直接答，别为建合约而建合约。',
+].join('\n');
+
+/** 读技能文件，拆 frontmatter。 */
+function readSkill(file, fallbackDescription) {
+  const raw = readFileSync(file, 'utf8');
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw);
+  const front = match === null ? '' : match[1];
+  const content = (match === null ? raw : raw.slice(match[0].length)).trim();
+  const line = front
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l.startsWith('description:'));
+  const description = line === undefined
+    ? fallbackDescription
+    : line.slice('description:'.length).trim().replace(/^["']|["']$/g, '');
+  return { description, content };
+}
+
+/** @param {object} ctx @param {string} key */
+function serviceOf(ctx, key) {
+  if (typeof ctx.get === 'function') return ctx.get(key);
+  return ctx[key];
+}
+
+/**
+ * 解析工作目录：显式参数 → 会话工作区 → 进程 cwd。
+ * @param {object} ctx @param {string} requested @param {object} [exec]
+ */
+async function resolveCwd(ctx, requested, exec) {
+  const explicit = String(requested ?? '').trim();
+  if (explicit) return path.resolve(explicit);
+  const workingDirectory = serviceOf(ctx, 'workingDirectory');
+  const agent = exec?.agent;
+  if (agent !== undefined && typeof workingDirectory?.ensure === 'function') {
+    try {
+      const cwd = await workingDirectory.ensure(agent, exec?.signal);
+      if (typeof cwd === 'string' && cwd.length > 0) return cwd;
+    } catch {
+      /* 退到会话头 */
+    }
+  }
+  const fromSession = agent?.session?.header?.cwd ?? agent?.cwd;
+  if (typeof fromSession === 'string' && fromSession.length > 0) return fromSession;
+  return process.cwd();
+}
+
+/** 工具共用：done_when 的参数 schema。 */
+const doneWhenSchema = {
+  type: 'array',
+  description: '机器层验收条件。每条必须能回答"怎么算做到了"，且答案是能真跑的命令。',
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['claim', 'check'],
+    properties: {
+      id: { type: 'string', description: '短 id，如 D1；省略自动编号。' },
+      claim: { type: 'string', description: '这一条要证明什么（一句话，尽量含可观测信号）。' },
+      check: { type: 'string', description: '能真跑的命令（shell）。exit 类必填；manual 类填空字符串。' },
+      cwd: { type: 'string', description: '可选：该命令的工作目录（相对工作区）。' },
+      timeout_ms: { type: 'number', description: '可选：单条超时，默认 120000。' },
+      expect: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind'],
+        properties: {
+          kind: {
+            type: 'string',
+            enum: ['exit', 'equals', 'contains', 'not_contains', 'matches', 'manual'],
+          },
+          value: { description: '期望值：exit→退出码；equals→stdout 全文；contains/not_contains→子串；matches→正则；manual→忽略。' },
+        },
+      },
+    },
+  },
+};
+
+/** 评审层参数 schema。 */
+const rubricSchema = {
+  type: 'object',
+  description: '评审层标准。判不了好坏、只能靠人看的质量维度写这里；纯工程任务可省略。',
+  additionalProperties: true,
+  properties: {
+    topic: { type: 'string', description: '这份标准针对什么题目。' },
+    bar: { type: 'number', description: `合格线，默认 ${DEFAULT_BAR}（发出去不会被问倒的水位）。` },
+    dims: {
+      type: 'array',
+      description: '4–6 个维度，权重合计 100。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'weight', 'criterion', 'pass_example', 'fail_example', 'intent', 'vision'],
+        properties: {
+          id: { type: 'string' },
+          name: { type: 'string' },
+          weight: { type: 'number', description: '10–30；会直接害人的给 25–30，只是不漂亮的给 10–15。' },
+          criterion: { type: 'string', description: '≥12 字，且必须含可被外部抽查的东西（路径/行号/数字/命令/原文片段）。' },
+          pass_example: { type: 'string', description: '≥8 字：什么样算过。' },
+          fail_example: { type: 'string', description: '≥8 字：什么样算没过。' },
+          intent: { type: 'string', description: '≥8 字：这条防的是哪种稿子。' },
+          vision: { type: 'string', description: '≥8 字：满分长什么样。' },
+          evidence: { type: 'string', description: '这条判据从题面/素材哪里来的。' },
+          machine: { type: 'array', items: { type: 'string' }, description: '顺带能写成命令的子判据（可选，会并进机器层核对）。' },
+        },
+      },
+    },
+    vetoes: {
+      type: 'array',
+      description: '红线：命中就不许交，不看分数。至少一条。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'why'],
+        properties: {
+          id: { type: 'string' },
+          name: { type: 'string' },
+          why: { type: 'string', description: '≥10 字：为什么命中就不能交。' },
+        },
+      },
+    },
+  },
+};
+
+/** goal_define 参数。 */
+const defineParameters = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['objective', 'done_when'],
+  properties: {
+    objective: { type: 'string', description: '交付什么、给谁用、什么规模。低于 12 字会被拒收。' },
+    done_when: doneWhenSchema,
+    rubric: rubricSchema,
+    rubric_file: { type: 'string', description: '也可以给一份 rubric.json 的路径（相对工作区），由教授角色产出。' },
+    constraints: { type: 'array', items: { type: 'string' }, description: '硬约束（不许动的东西、必须用的技术、时间）。' },
+    non_goals: { type: 'array', items: { type: 'string' }, description: '明确不做的事——挡住范围膨胀。' },
+    budget: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        max_rounds: { type: 'number', description: '最多检查几轮，默认 5。' },
+        max_minutes: { type: 'number', description: '时间预算，默认 90。' },
+      },
+    },
+    id: { type: 'string', description: '更新既有目标时传同一个 id（revision 会自动 +1）；新建留空。' },
+    cwd: { type: 'string', description: '工作区目录，省略用当前会话工作区。' },
+  },
+};
+
+/** goal_check 参数。 */
+const checkParameters = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', description: '目标 id，省略取最近一个未放弃的目标。' },
+    only: { type: 'array', items: { type: 'string' }, description: '只跑这些条件 id（调试用，正式验收不要用）。' },
+    cwd: { type: 'string', description: '工作区目录。' },
+  },
+};
+
+/** goal_review 参数。 */
+const reviewParameters = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', description: '目标 id，省略取最近一个。' },
+    review: {
+      type: 'object',
+      description: '判分内容：{reviewer, round, dims:[{id,score,quote:{file,text,line},deduction,beyond_spec}], vetoes_hit, total, blocked}。',
+      additionalProperties: true,
+    },
+    review_file: { type: 'string', description: '也可以给判分文件路径（相对工作区或绝对），如 review-1.json（即 score-v1.json）。' },
+    cwd: { type: 'string', description: '工作区目录。' },
+  },
+};
+
+/** goal_verdict / goal_status 参数。 */
+const verdictParameters = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', description: '目标 id，省略取最近一个未放弃的目标。' },
+    cwd: { type: 'string', description: '工作区目录。' },
+  },
+};
+
+/** 读一份 JSON（容忍 BOM）。 */
+function readJsonFile(file) {
+  const raw = readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+  return JSON.parse(raw);
+}
+
+/** 解析 rubric：内联优先，其次文件。 */
+function resolveRubric(args, cwd) {
+  if (args.rubric && typeof args.rubric === 'object') {
+    return normalizeRubric({ ...args.rubric, source: 'inline' });
+  }
+  const rel = String(args.rubric_file ?? '').trim();
+  if (!rel) return null;
+  const abs = path.resolve(cwd, rel);
+  if (!existsSync(abs)) throw new Error(`rubric_file 不存在：${rel}`);
+  return normalizeRubric({ ...readJsonFile(abs), source: path.basename(abs) });
+}
+
+/**
+ * @param {object} ctx Cordis 上下文
+ */
+export function apply(ctx) {
+  const log = (msg) => ctx.logger?.warn?.(`dsh-goal-loop: ${msg}`);
+
+  // 0) 常驻政策段：双层闸门不靠"记得加载技能"，直接进系统提示。
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['systemPrompt'], (promptCtx) => {
+      const systemPrompt = serviceOf(promptCtx, 'systemPrompt');
+      if (typeof systemPrompt?.section !== 'function') return;
+      const register = () => systemPrompt.section({
+        name: 'goal:loop',
+        ...(typeof systemPrompt.getSectionOrder === 'function'
+          ? { order: systemPrompt.getSectionOrder('TOOL_GOAL') }
+          : {}),
+        text: POLICY_SECTION,
+      });
+      try {
+        if (typeof promptCtx.effect === 'function') promptCtx.effect(register, 'goal.loop.policy');
+        else register();
+      } catch (error) {
+        log(`policy section failed: ${String(error)}`);
+      }
+    });
+  }
+
+  // 1) 行为协议：主技能 + 三个角色稿
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['skills'], (skillCtx) => {
+      const skills = serviceOf(skillCtx, 'skills');
+      if (typeof skills?.register !== 'function') return;
+      const register = (payload) => {
+        try {
+          skills.register(payload);
+        } catch (error) {
+          log(`skill ${payload.name} 未注册：${String(error)}`);
+        }
+      };
+      try {
+        const { description, content } = readSkill(
+          SKILL_FILE,
+          '目标工程双层闸门：机器层全绿 + 独立评审过线，两层都过才算能交。',
+        );
+        register({
+          name: SKILL_NAME,
+          description,
+          content,
+          source: SKILL_FILE,
+          resourceBase: { kind: 'directory', path: AGENT_DIR },
+          invocation: { modelInvocable: true, userInvocable: true },
+        });
+      } catch (error) {
+        log(`主技能读取失败：${String(error)}`);
+      }
+      for (const role of ['professor', 'tutor', 'reviewer']) {
+        const file = path.join(AGENT_DIR, `${role}.md`);
+        try {
+          const { description, content } = readSkill(file, `${role} 角色稿`);
+          register({
+            name: `goal-${role}`,
+            description,
+            content,
+            source: file,
+            invocation: { modelInvocable: true, userInvocable: true },
+          });
+        } catch (error) {
+          log(`角色技能 ${role} 未注册：${String(error)}`);
+        }
+      }
+    });
+  }
+
+  // 2) 斜杠命令
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['commands'], (commandCtx) => {
+      const commands = serviceOf(commandCtx, 'commands');
+      if (typeof commands?.register !== 'function') return;
+      const add = (payload) => {
+        try {
+          commands.register(payload);
+        } catch (error) {
+          log(`命令 ${payload.name} 注册失败：${String(error)}`);
+        }
+      };
+
+      add({
+        definitionId: 'dsh-goal-loop/goal',
+        name: 'goal',
+        description: '进入目标工程：先说清交付什么，编译成双层合约，再动手；两层都过才算完成',
+        input: { hint: '<你要交付的东西>', attachments: false },
+        handler: () => ({
+          kind: 'prompt',
+          text: [
+            '按目标工程双层闸门处理下面这件事：先读 skill goal-loop。',
+            '1) 用 goal_define 编译合约：objective / done_when / non_goals，判不了好坏的质量维度写进 rubric；',
+            '2) 合约被拒收就补全，不许"先干着看"；',
+            '3) 动手，然后 goal_check；只修红灯列出的项，修完重跑；',
+            '4) 有 rubric 就派独立判分人（不是动手的那一个），把判分交 goal_review；',
+            '5) 说完成之前调 goal_verdict，deliverable=true 才许汇报。',
+          ].join('\n'),
+        }),
+      });
+
+      add({
+        definitionId: 'dsh-goal-loop/review',
+        name: 'review',
+        description: '对已完成的交付做独立评审：按 rubric 打分并交机器审计（引文逐字对、分数重算）',
+        input: { hint: '<被评审的文件或目标 id>', attachments: false },
+        handler: (input) => ({
+          kind: 'prompt',
+          text: [
+            `对「${String(input?.text ?? '').trim() || '当前交付物'}」做一次独立评审。`,
+            '先读 skill goal-loop 与 skill goal-reviewer。',
+            '1) goal_status 拿到 rubric；',
+            '2) 逐维给 0/4/7/10，每一档必须附一句在该文件里逐字存在的原文（≥12 字）与行号；',
+            '3) 扣分的维度必须写成「把 <文件>:<行> 的「原文」改成「新句」」；',
+            '4) 总分不自己算，交给 goal_review 重算；',
+            '5) 命中红线直接列出 vetoes_hit，不要试图用高分盖过去。',
+          ].join('\n'),
+        }),
+      });
+    });
+  }
+
+  // 3) goal_define
+  ctx.tools.register({
+    name: 'goal_define',
+    description:
+      '把需求编译成「双层目标合约」并落盘到 .goal/<id>/goal.json。done_when 是机器层（每条一个能真跑的命令）；rubric 是评审层（4–6 维、权重合计 100、每维有正反例、至少一条红线）。合约不合格会被拒收且不落盘——按 errors 补全后重调。这是目标工程的第一步：动手之前先让目标可验收。',
+    parameters: defineParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'id', 'dir', 'errors', 'warnings', 'gated', 'message'],
+        properties: {
+          ok: { type: 'boolean', description: '合约是否通过校验并落盘。' },
+          id: { type: 'string' },
+          dir: { type: 'string', description: '台账目录绝对路径。' },
+          errors: { type: 'array', items: { type: 'string' }, description: '必须修掉的硬错误。' },
+          warnings: { type: 'array', items: { type: 'string' }, description: '不会拦下但会削弱验收的提醒。' },
+          gated: { type: 'boolean', description: '是否有评审层（rubric）。' },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const existing = String(args.id ?? '').trim();
+      let prev = null;
+      if (existing) {
+        try {
+          prev = await loadContract(cwd, existing);
+        } catch {
+          prev = null;
+        }
+      }
+
+      let rubric = null;
+      let rubricErrors = [];
+      let rubricWarnings = [];
+      try {
+        rubric = resolveRubric(args, cwd) ?? (prev?.rubric ? normalizeRubric(prev.rubric) : null);
+        const rv = validateRubric(rubric);
+        rubricErrors = rv.errors;
+        rubricWarnings = rv.warnings;
+      } catch (error) {
+        rubricErrors = [`rubric 读不出来：${String(error.message ?? error)}`];
+      }
+
+      const contract = normalizeContract(
+        {
+          id: existing || undefined,
+          objective: args.objective,
+          done_when: args.done_when,
+          constraints: args.constraints,
+          non_goals: args.non_goals,
+          budget: args.budget,
+          created_at: prev?.created_at,
+          status: prev?.status ?? 'open',
+          revision: prev ? Number(prev.revision || 1) + 1 : 1,
+        },
+        new Date(),
+      );
+      contract.rubric = rubric;
+      const verdict = validateContract(contract);
+      const errors = [...verdict.errors, ...rubricErrors];
+      const warnings = [...verdict.warnings, ...rubricWarnings];
+      const gated = Boolean(rubric?.dims?.length);
+
+      if (errors.length) {
+        return {
+          ok: false,
+          id: contract.id,
+          dir: goalDir(cwd, contract.id),
+          errors,
+          warnings,
+          gated,
+          message: `合约被拒收（${errors.length} 项）：${errors[0]} 修完再调 goal_define。`,
+        };
+      }
+
+      const { dir } = await saveContract(cwd, contract, { actor: 'goal_define', note: prev ? 'update' : 'create' });
+      return {
+        ok: true,
+        id: contract.id,
+        dir,
+        errors: [],
+        warnings,
+        gated,
+        message: gated
+          ? `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收 + ${rubric.dims.length} 维评审，合格线 ${rubric.bar}）。下一步动手，然后 goal_check。`
+          : `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收，无评审层）。下一步动手，然后 goal_check。`,
+      };
+    },
+  });
+
+  // 4) goal_check
+  ctx.tools.register({
+    name: 'goal_check',
+    description:
+      '真跑合约里的每条 check（机器层），落 .goal/<id>/proof-<n>.json，返回三态结论。green=true 只代表机器层全绿，不代表能交（有 rubric 时还要过评审层）。fail/unknown 时必须先修、再重跑。unknown 来自 manual 条目或执行异常，不计入绿灯。',
+    parameters: checkParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'green', 'id', 'summary', 'verdict', 'report', 'proof'],
+        properties: {
+          ok: { type: 'boolean', description: '检查是否成功执行（不代表通过）。' },
+          green: { type: 'boolean', description: '机器层是否全绿。' },
+          id: { type: 'string' },
+          summary: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['total', 'pass', 'fail', 'unknown'],
+            properties: {
+              total: { type: 'number' },
+              pass: { type: 'number' },
+              fail: { type: 'number' },
+              unknown: { type: 'number' },
+            },
+          },
+          verdict: { type: 'string', description: '一句话判定。' },
+          report: { type: 'string', description: 'Markdown 报告（含每条证据）。' },
+          proof: { type: 'string', description: '本轮 proof 文件路径。' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.verdict }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const contract = await resolveContract(cwd, String(args.id ?? '').trim() || undefined);
+      const results = await runContract(contract, {
+        cwd,
+        only: Array.isArray(args.only) ? args.only.map(String) : undefined,
+      });
+      const { file, round } = await saveProof(cwd, contract, results, { actor: 'goal_check' });
+      const s = summarize(results);
+      if (s.green && contract.status !== 'green') {
+        await setStatus(cwd, contract.id, 'green', `proof ${path.basename(file)}`);
+      }
+      const gated = Boolean(contract.rubric?.dims?.length);
+      const tail = s.green && gated ? '（机器层全绿；还有评审层没过，别急着汇报）' : '';
+      return {
+        ok: true,
+        green: s.green,
+        id: contract.id,
+        summary: { total: s.total, pass: s.pass, fail: s.fail, unknown: s.unknown },
+        verdict: `${verdictLine(results)}${tail}`,
+        report: renderReport(contract, results, round),
+        proof: file,
+      };
+    },
+  });
+
+  // 5) goal_review
+  ctx.tools.register({
+    name: 'goal_review',
+    description:
+      '提交一次独立判分并落 .goal/<id>/review-<n>.json。机器会审计这份判分：reviewer 不能是 self；每维分数只能是 0/4/7/10；每档必须附一句在被评审文件里逐字存在的原文（≥12 字，找不到即作废）；扣分的维度必须写出「把 X 改成 Y」；总分由机器按权重重算，不采信手报的数；命中红线直接不许交。审计不通过时按 errors 修判分再提交。',
+    parameters: reviewParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'id', 'total', 'bar', 'vetoes_hit', 'deliverable', 'errors', 'warnings', 'file', 'message'],
+        properties: {
+          ok: { type: 'boolean', description: '判分是否通过机器审计。' },
+          id: { type: 'string' },
+          total: { type: 'number', description: '机器重算的总分。' },
+          bar: { type: 'number', description: '合格线。' },
+          vetoes_hit: { type: 'array', items: { type: 'string' } },
+          deliverable: { type: 'boolean', description: '这份判分是否足以放行（不含机器层结论）。' },
+          errors: { type: 'array', items: { type: 'string' } },
+          warnings: { type: 'array', items: { type: 'string' } },
+          file: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const contract = await resolveContract(cwd, String(args.id ?? '').trim() || undefined);
+      const rubric = normalizeRubric(contract.rubric) ?? null;
+      if (!rubric?.dims?.length) {
+        return {
+          ok: false, id: contract.id, total: 0, bar: DEFAULT_BAR, vetoes_hit: [],
+          deliverable: false, errors: ['这个目标没有 rubric：没有标准就没法判分。先用 goal_define 补 rubric。'],
+          warnings: [], file: '', message: '拒收：目标没有评审层标准（rubric）。',
+        };
+      }
+
+      let review = args.review;
+      const rel = String(args.review_file ?? '').trim();
+      if (!review && rel) {
+        const abs = path.resolve(cwd, rel);
+        if (!existsSync(abs)) {
+          return {
+            ok: false, id: contract.id, total: 0, bar: rubric.bar, vetoes_hit: [],
+            deliverable: false, errors: [`review_file 不存在：${rel}`],
+            warnings: [], file: '', message: `拒收：读不到判分文件 ${rel}。`,
+          };
+        }
+        try {
+          review = readJsonFile(abs);
+        } catch (error) {
+          return {
+            ok: false, id: contract.id, total: 0, bar: rubric.bar, vetoes_hit: [],
+            deliverable: false, errors: [`review_file 解析失败：${String(error.message ?? error)}`],
+            warnings: [], file: '', message: '拒收：判分文件不是合法 JSON。',
+          };
+        }
+      }
+      if (!review || typeof review !== 'object') {
+        return {
+          ok: false, id: contract.id, total: 0, bar: rubric.bar, vetoes_hit: [],
+          deliverable: false, errors: ['缺 review：要么传 review 对象，要么传 review_file。'],
+          warnings: [], file: '', message: '拒收：没有判分内容。',
+        };
+      }
+
+      const audited = validateReview(review, rubric, cwd);
+      const { file } = await saveReview(cwd, contract, { ...review, audited }, { actor: 'goal_review' });
+      const pass = audited.ok && audited.deliverable;
+      return {
+        ok: audited.ok,
+        id: contract.id,
+        total: Number.isFinite(audited.total) ? audited.total : 0,
+        bar: rubric.bar,
+        vetoes_hit: audited.vetoes_hit,
+        deliverable: audited.deliverable,
+        errors: audited.errors,
+        warnings: audited.warnings,
+        file,
+        message: audited.deliverable
+          ? `判分通过：${audited.total} ≥ ${rubric.bar}，无红线。${audited.warnings.length ? `（${audited.warnings.length} 条提醒）` : ''} 还差机器层：调 goal_verdict 看终局。`
+          : `判分未通过：${audited.errors[0] ?? `总分 ${audited.total} 未达 ${rubric.bar}`}${audited.errors.length > 1 ? `（共 ${audited.errors.length} 项）` : ''}`,
+      };
+    },
+  });
+
+  // 6) goal_verdict
+  ctx.tools.register({
+    name: 'goal_verdict',
+    description:
+      '读盘上最近一次机器层结果（proof）与最近一次判分（review），给唯一裁决：deliverable=true 才允许汇报完成。机器层未全绿一定不能交；有 rubric 时评审层也必须过线且无红线。会落 .goal/<id>/gate.json 留痕。',
+    parameters: verdictParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['deliverable', 'gated', 'id', 'machine_green', 'total', 'bar', 'reasons', 'message', 'file'],
+        properties: {
+          deliverable: { type: 'boolean' },
+          gated: { type: 'boolean' },
+          id: { type: 'string' },
+          machine_green: { type: 'boolean' },
+          total: { type: ['number', 'null'] },
+          bar: { type: ['number', 'null'] },
+          reasons: { type: 'array', items: { type: 'string' } },
+          message: { type: 'string' },
+          file: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const contract = await resolveContract(cwd, String(args.id ?? '').trim() || undefined);
+      const rubric = normalizeRubric(contract.rubric) ?? null;
+
+      const proof = await loadLatestProof(cwd, contract.id).catch(() => null);
+      const machineGreen = Boolean(proof?.summary?.green);
+      const reviewRec = await loadLatestReview(cwd, contract.id).catch(() => null);
+      const audited = reviewRec?.audited ?? null;
+
+      const verdict = decide({ machineGreen, rubric, review: audited });
+      if (!proof) verdict.reasons.unshift('还没有跑过 goal_check');
+      const { file } = await saveGate(cwd, contract, {
+        ...verdict,
+        id: contract.id,
+        machine_green: machineGreen,
+        proof: proof ? proof.file ?? null : null,
+        review: reviewRec ? reviewRec.file ?? null : null,
+        at: new Date().toISOString(),
+      });
+
+      if (verdict.deliverable && contract.status !== 'green') {
+        await setStatus(cwd, contract.id, 'green', 'gate 放行');
+      }
+
+      return {
+        deliverable: verdict.deliverable,
+        gated: verdict.gated,
+        id: contract.id,
+        machine_green: machineGreen,
+        total: verdict.total,
+        bar: verdict.bar,
+        reasons: verdict.reasons,
+        message: `${decideLine(verdict)}（${contract.id}）`,
+        file,
+      };
+    },
+  });
+
+  // 7) goal_status
+  ctx.tools.register({
+    name: 'goal_status',
+    description:
+      '看目标台账：每个目标的 objective、状态、机器层最近一轮 pass/fail/unknown、评审层总分与合格线，以及目录路径。开工前用它确认"现在差哪几条"，汇报前用它确认"到底能不能交"。',
+    parameters: verdictParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'goals', 'message'],
+        properties: {
+          ok: { type: 'boolean' },
+          goals: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const id = String(args.id ?? '').trim();
+      if (id) {
+        const c = await loadContract(cwd, id);
+        const goals = (await listGoals(cwd)).filter((g) => g.id === id);
+        const reviewRec = await loadLatestReview(cwd, id).catch(() => null);
+        const gated = Boolean(c.rubric?.dims?.length);
+        const bar = gated ? c.rubric.bar : null;
+        const total = reviewRec?.audited?.total ?? null;
+        return {
+          ok: true,
+          goals: [{
+            ...c,
+            dir: goalDir(cwd, id),
+            review_dir: reviewDir(cwd, id),
+            rubric_bar: bar,
+            review_total: total,
+            ...(goals[0] ?? {}),
+          }],
+          message: `${c.id}：${c.objective}（机器层 ${c.done_when.length} 条，最近一轮 ${describeProof(goals[0])}${gated ? `；评审层 ${c.rubric.dims.length} 维，合格线 ${bar}，最近判分 ${total === null ? '未判' : total}` : '；无评审层'}）`,
+        };
+      }
+      const goals = await listGoals(cwd);
+      if (goals.length === 0) {
+        return { ok: true, goals: [], message: '台账为空：还没有目标合约。用 goal_define 建一份再开工。' };
+      }
+      const lines = [];
+      for (const g of goals) {
+        const reviewRec = await loadLatestReview(cwd, g.id).catch(() => null);
+        const gated = Boolean(g.rubric?.dims?.length);
+        const reviewPart = gated
+          ? `｜评审 ${reviewRec?.audited?.total ?? '未判'}/${g.rubric.bar}`
+          : '｜无评审层';
+        lines.push(`- ${g.id} [${g.status}] ${g.objective} → ${describeProof(g)}${reviewPart}`);
+      }
+      return {
+        ok: true,
+        goals,
+        message: [`目标台账（${goals.length} 个）：`, ...lines].join('\n'),
+      };
+    },
+  });
+}
+
+/** @param {object|undefined} g */
+function describeProof(g) {
+  if (!g || !g.last_summary) return '未检查';
+  const s = g.last_summary;
+  return `${s.pass}/${s.total} pass，fail ${s.fail}，unknown ${s.unknown}`;
+}

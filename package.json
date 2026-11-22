@@ -1,0 +1,99 @@
+{
+  "name": "dsh-goal-loop",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "目标工程双层闸门 for DeepSeek Harness：机器层（命令能判的全绿）+ 评审层（独立判分过线、无红线），两层都过才算能交。",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./lib/goal-core.mjs": "./lib/goal-core.mjs",
+    "./lib/rubric-core.mjs": "./lib/rubric-core.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "bin",
+    "lib",
+    "skill",
+    "agents",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "install.ps1",
+    "uninstall.ps1",
+    "rubric.example.json"
+  ],
+  "bin": {
+    "goal-loop": "./bin/goal.mjs"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dshWorkshop": {
+    "schema": "omdsh-workshop-package/v1",
+    "type": "plugin",
+    "integration": {
+      "protocol": "harness-profile",
+      "artifact": "cordis.patch.yml"
+    },
+    "install": {
+      "mode": "transactional",
+      "adapter": "profile-bundle",
+      "failurePolicy": "generation-rollback",
+      "touchesCurrentBeforeActivation": false
+    },
+    "lifecycle": {
+      "activation": "restart-profile",
+      "dispose": "supported"
+    },
+    "permissions": [
+      "filesystem:read",
+      "filesystem:write",
+      "process:spawn"
+    ],
+    "capability": {
+      "id": "goal-loop",
+      "kind": "skill+tools+command",
+      "invocation": "skill goal-loop / /goal / /review",
+      "expected": "技能目录出现 goal-loop（外加 goal-professor / goal-tutor / goal-reviewer 三个角色稿）；工具列表出现 goal_define / goal_check / goal_review / goal_verdict / goal_status；.goal/<id>/ 下落盘 goal.json、proof-N.json、review-N.json、gate.json"
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "demo": "node bin/goal.mjs demo"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "goal-engineering",
+    "goal",
+    "rubric",
+    "verification",
+    "definition-of-done",
+    "agent-evaluation",
+    "gate"
+  ],
+  "author": "hechenhao9",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hechenhao9/dsh-goal-loop.git"
+  },
+  "homepage": "https://github.com/hechenhao9/dsh-goal-loop#readme",
+  "bugs": {
+    "url": "https://github.com/hechenhao9/dsh-goal-loop/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.3"
+  }
+}
