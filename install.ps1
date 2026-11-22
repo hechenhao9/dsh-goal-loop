@@ -47,7 +47,16 @@ if ($bundles -contains $pluginName) {
     Write-Host "[new] appended $pluginName to dsh.profile.bundles (backup: package.json.bak-goal)"
 }
 
+# 3) dependency record: the sidebar plugin page lists a bundle only when the
+#    profile declares it under dependencies. A junction plus a bundles entry is
+#    enough to load the plugin, but the page has no card for it -- and therefore
+#    no on/off switch. link: keeps the record pointing at this working tree.
+$node = (Get-Command node -ErrorAction Stop).Source
+& $node (Join-Path $here 'scripts-link-dep.mjs') $manifestPath $here
+if ($LASTEXITCODE -ne 0) { throw "failed to record $pluginName in profile dependencies" }
+
 Write-Host ""
 Write-Host "Next: the profile reloads on save. Expect goal-loop in the skill catalog"
-Write-Host "and goal_define / goal_check / goal_review / goal_verdict / goal_status in the tool list."
+Write-Host "and the eight goal_* tools in the tool list. The sidebar plugin page now has"
+Write-Host "a bundle card with an on/off switch (it lists profile dependencies)."
 Write-Host "If not visible, quit and reopen the client once."

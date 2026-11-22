@@ -1,4 +1,4 @@
-﻿# dsh bundle patch: 把目标工程双层闸门插件插入 profile 组合层。
+# dsh bundle patch: 把目标工程三层闸门插件插入 profile 组合层。
 - insert:
     - id: dsh-goal-loop
       name: 'dsh-goal-loop'

@@ -119,6 +119,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 - 8 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_doctor`、`goal_status`
 - 2 个命令：`/goal`、`/review`
 
+`install.ps1` 写三处：`node_modules` 下的 junction、`dsh.profile.bundles`、以及 `dependencies` 里的 `link:` 记录。第三处不是装得能跑所必需的，但**侧栏「插件」页只列 profile 依赖记录里的组合包**——少了它，插件照常加载，页面上却没有卡片，也就没有启停开关。`uninstall.ps1` 三处一起清。
+
 ### 不开 DSH 也能用（CLI 兜底）
 
 ```powershell

@@ -1,5 +1,5 @@
 /**
- * dsh-goal-loop — 目标工程 × 双团队评审，双层闸门。
+ * dsh-goal-loop — 目标工程 × 双团队评审 × 盲预测校准，三层闸门。
  *
  * 上一代 dsh-goal-engineering 解决「机器能验的部分」：一条命令，0/1，全绿才算完成。
  * dsh-judge-loop 解决「机器验不了的部分」：标准由不看稿的人写，判分由不是作者的人给。
@@ -412,7 +412,7 @@ function resolveRubric(args, cwd) {
 export function apply(ctx) {
   const log = (msg) => ctx.logger?.warn?.(`dsh-goal-loop: ${msg}`);
 
-  // 0) 常驻政策段：双层闸门不靠"记得加载技能"，直接进系统提示。
+  // 0) 常驻政策段：三层闸门不靠"记得加载技能"，直接进系统提示。
   if (typeof ctx.inject === 'function') {
     ctx.inject(['systemPrompt'], (promptCtx) => {
       const systemPrompt = serviceOf(promptCtx, 'systemPrompt');

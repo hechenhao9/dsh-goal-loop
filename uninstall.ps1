@@ -29,6 +29,14 @@ if (Test-Path $manifestPath) {
     } else {
         Write-Host "[ok] bundles does not contain $pluginName"
     }
+
+    # Drop the dependency record too: leaving it behind would keep a card for a
+    # plugin whose files are gone, and pnpm would try to resolve the dead link.
+    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if ($node) {
+        $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+        & $node (Join-Path $here 'scripts-link-dep.mjs') $manifestPath $here remove
+    }
 }
 
 Write-Host "Restart the client to unload the plugin. .goal/ ledgers are untouched."
