@@ -57,12 +57,12 @@ test('入口导出形态正确', () => {
   assert.equal(typeof apply, 'function');
 });
 
-test('apply 注册 8 个工具 + 4 技能 + 2 命令', () => {
+test('apply 注册 9 个工具 + 4 技能 + 3 命令', () => {
   const { ctx, tools, skills, commands } = fakeCtx();
   apply(ctx);
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ['goal_check', 'goal_define', 'goal_doctor', 'goal_predict', 'goal_retro', 'goal_review', 'goal_status', 'goal_verdict'],
+    ['goal_check', 'goal_define', 'goal_doctor', 'goal_mode', 'goal_predict', 'goal_retro', 'goal_review', 'goal_status', 'goal_verdict'],
   );
   for (const t of tools) {
     assert.equal(typeof t.execute, 'function');
@@ -77,8 +77,8 @@ test('apply 注册 8 个工具 + 4 技能 + 2 命令', () => {
   const main = skills.find((s) => s.name === 'goal-loop');
   assert.ok(main.description.length > 10);
   assert.ok(main.content.includes('三层闸门'));
-  assert.equal(commands.length, 2);
-  assert.deepEqual(commands.map((c) => c.name).sort(), ['goal', 'review']);
+  assert.equal(commands.length, 3);
+  assert.deepEqual(commands.map((c) => c.name).sort(), ['goal', 'goal-mode', 'review']);
 });
 
 test('apply 注册常驻政策段到 systemPrompt', () => {
@@ -97,7 +97,7 @@ test('config.policy=false 时不注册常驻政策段，工具照常注册', () 
   const { ctx, sections, tools } = fakeCtx();
   apply(ctx, { policy: false });
   assert.equal(sections.length, 0, '关掉开关就不该每轮为提示付费');
-  assert.equal(tools.length, 8, '关开关只影响提示，不卸载工具');
+  assert.equal(tools.length, 9, '关开关只影响提示，不卸载工具');
 });
 
 test('config.skills=false / commands=false 只影响对应层', () => {
@@ -106,7 +106,7 @@ test('config.skills=false / commands=false 只影响对应层', () => {
   assert.equal(sections.length, 1, '政策段没关');
   assert.equal(skills.length, 0, '技能被关');
   assert.equal(commands.length, 0, '命令被关');
-  assert.equal(tools.length, 8, '工具不受影响');
+  assert.equal(tools.length, 9, '工具不受影响');
 });
 
 test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', () => {
@@ -117,7 +117,7 @@ test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', ()
     logger: { warn: () => {} },
   };
   assert.doesNotThrow(() => apply(ctx));
-  assert.equal(tools.length, 8);
+  assert.equal(tools.length, 9);
 });
 
 test('端到端：define(rubric) → check → review → verdict', async () => {

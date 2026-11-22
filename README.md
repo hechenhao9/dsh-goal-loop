@@ -116,26 +116,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 - 常驻行为协议 `goal-loop`（不用点名，模型自己在该建合约时会建）
 - 三个角色稿：`goal-professor`（只定标准，不看稿）/ `goal-tutor`（按标准做到位）/ `goal-reviewer`（独立判分）
-- 8 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_doctor`、`goal_status`
+- 9 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_doctor`、`goal_status`、`goal_mode`
 - 2 个命令：`/goal`、`/review`
 
 `install.ps1` 写三处：`node_modules` 下的 junction、`dsh.profile.bundles`、以及 `dependencies` 里的 `link:` 记录。第三处不是装得能跑所必需的，但**侧栏「插件」页只列 profile 依赖记录里的组合包**——少了它，插件照常加载，页面上却没有卡片，也就没有启停开关。`uninstall.ps1` 三处一起清。
 
 ### 开关：入口在哪，怎么关
 
-**入口在侧栏「插件」页，不在对话框里。** 装了 `dsh-sidebar-fold` 这类折叠插件的话，它会把左侧面板（插件 / 外贸工作台 / 供应商诊断…）收进一行「功能」，点开「功能」才看得到——这不是插件没装上。本仓库安装时不动别人的插件；要恢复折叠，把 profile `cordis.patch.yml` 里 `- id: sidebar-fold` 的 `disabled: true` 改回 `false`。
+**从 1.3.0 起，开关就在对话框里**：输入框那排（`完全权限`「AI 控制电脑」那一行）会出现一个「目标工程」chip。点一下切换，开着时 chip 亮起并写「目标工程」，关着时写「目标工程 · 关」。它显示的是宿主的真实状态，不是自己存的一份副本。
 
-三档开关，从粗到细：
+chip 走的通路是宿主的 `/goal-mode` 命令，三个入口共用一个状态：
+
+| 入口 | 说明 |
+|---|---|
+| 输入框「目标工程」chip | 点一下切换；打开时第一次就绪会先问一次状态 |
+| `/goal-mode` | 在输入框敲：不带参数＝切换，`on` / `off` / `status` 分别是指定开、指定关、只查 |
+| `goal_mode` 工具 | 给 agent 用的那一面；不带 `enabled` 就是查 |
+
+关闭时发生什么：常驻政策段（三层闸门那一段）**下一轮就不再进系统提示**，9 个 `goal_*` 工具与 `skill goal-loop` 都还在——你自己打 `/goal` 仍能按那套流程走。打开则恢复。
+
+状态落盘在 `<工作区>/.goal/mode.json`（`{enabled, updated_at, by}`）。它是留痕不是权威：真正生效的是进程内存里的开关，**重启 DSH 会回到 `config.policy` 的默认值**（缺省 `true`）。
+
+**另一个入口是侧栏「插件」页**（整个插件的总开关）。装了 `dsh-sidebar-fold` 这类折叠插件的话，它会把左侧面板（插件 / 外贸工作台 / 供应商诊断…）收进一行「功能」，点开「功能」才看得到——这不是插件没装上。本仓库安装时不动别人的插件；要恢复折叠，把 profile `cordis.patch.yml` 里 `- id: sidebar-fold` 的 `disabled: true` 改回 `false`。
+
+从粗到细三档：
 
 | 想关什么 | 怎么关 |
 |---|---|
 | 整个插件 | 侧栏「插件 → 已安装插件 → `dsh-goal-loop`」那一行开关（写的是 profile `cordis.patch.yml` 的 `disabled`） |
-| 只关常驻提示（工具照旧） | profile `cordis.patch.yml` 里 `- id: dsh-goal-loop` 下写 `config: { policy: false }` |
+| 只关常驻提示（工具照旧） | 输入框「目标工程」chip，或 `/goal-mode off`，或 profile `- id: dsh-goal-loop` 下写 `config: { policy: false }` |
 | 关技能 / 关斜杠命令 | 同上，`config: { skills: false }` 或 `{ commands: false }` |
 
-三个键缺省都是 `true`，写 `false` 才关。关掉 `policy` 之后 8 个 `goal_*` 工具照常可用、`skill goal-loop` 仍能手动加载，只是不再每轮自动进系统提示——常驻段每轮都要付费，偶尔做交付的人没必要天天带着。
+三个 config 键缺省都是 `true`，写 `false` 才关。关掉 `policy` 之后 9 个 `goal_*` 工具照常可用、`skill goal-loop` 仍能手动加载，只是不再每轮自动进系统提示——常驻段每轮都要付费，偶尔做交付的人没必要天天带着。
 
-诚实一句：这个插件的 `Config` 没有声明 schemastery schema（它装在 profile 之外的工作树里，真实路径解析链够不到 `@deepseek-ai/schemastery`，声明了整插件会加载失败），所以设置面板里不会给你表单，开关只能改 patch 文件。
+诚实两条：① 这个插件的 `Config` 没有声明 schemastery schema（它装在 profile 之外的工作树里，真实路径解析链够不到 `@deepseek-ai/schemastery`，声明了整插件会加载失败），所以设置面板里没有表单，只能走 chip / 命令 / patch 文件；② 开关是**进程级**的，不是每会话独立——一个 DSH 里所有会话共用一个状态。
 
 ### 不开 DSH 也能用（CLI 兜底）
 

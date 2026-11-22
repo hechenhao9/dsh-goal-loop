@@ -18,7 +18,7 @@
  *   扣分是否落成了「把 X 改成 Y」（说不清怎么改的扣分不算数）；
  *   红线是否命中（命中则分数再高也不许交）。
  *
- * 八个工具：
+ * 九个工具：
  *   goal_define   编译合约（含 rubric / 代价台账 / 拒绝清单），不合格直接拒收，不落盘；dry_run 只验不落。
  *   goal_check    真跑机器层，落 proof-<n>.json；only 参数用于调试单条。
  *   goal_review   提交判分，机器审计后落 review-<n>.json，同时写 review-brief.json（判分任务书）。
@@ -52,6 +52,8 @@ import {
   saveProof,
   setStatus,
   goalDir,
+  readMode,
+  writeMode,
 } from './lib/goal-store.mjs';
 import {
   normalizeRubric,
@@ -115,6 +117,14 @@ const POLICY_SECTION = [
   '不建合约：纯问答、单点排错、闲聊——直接答，别为建合约而建合约。',
 ].join('\n');
 
+/**
+ * 运行期开关：政策段是否进系统提示。
+ * 三个入口共享同一个状态：`goal_mode` 工具、`/goal-mode` 命令、输入框那排的 chip。
+ * 关掉后 POLICY_SECTION 渲染成空串——工具与技能仍在，只是不再每轮自动提醒。
+ * 只作用于当前 DSH 进程（重启回到 config.policy 的默认值），落盘只作记录。
+ */
+const runtime = { enabled: true };
+
 /** 读技能文件，拆 frontmatter。 */
 function readSkill(file, fallbackDescription) {
   const raw = readFileSync(file, 'utf8');
@@ -157,6 +167,30 @@ async function resolveCwd(ctx, requested, exec) {
   const fromSession = agent?.session?.header?.cwd ?? agent?.cwd;
   if (typeof fromSession === 'string' && fromSession.length > 0) return fromSession;
   return process.cwd();
+}
+
+/**
+ * 命令处理器里同步取 cwd（那里拿不到 exec，只有 invocation.agent）。
+ * 拿不到就退回进程目录——只用于写开关留痕，写错地方不影响渲染。
+ * @param {object} [agent]
+ */
+function modeCwd(agent) {
+  const fromSession = agent?.session?.header?.cwd ?? agent?.cwd;
+  return typeof fromSession === 'string' && fromSession.length > 0 ? fromSession : process.cwd();
+}
+
+/**
+ * 改开关：内存立刻生效（下一轮渲染就读到新值），磁盘留痕失败不影响内存。
+ * @param {string} cwd @param {boolean} enabled @param {string} by
+ */
+async function setMode(cwd, enabled, by) {
+  runtime.enabled = enabled === true;
+  try {
+    await writeMode(cwd, runtime.enabled, by);
+  } catch {
+    /* 留痕失败不改开关本身 */
+  }
+  return runtime.enabled;
 }
 
 /** 工具共用：done_when 的参数 schema。 */
@@ -444,7 +478,10 @@ export function apply(ctx, config = {}) {
         ...(typeof systemPrompt.getSectionOrder === 'function'
           ? { order: systemPrompt.getSectionOrder('TOOL_GOAL') }
           : {}),
-        text: POLICY_SECTION,
+        // getter：渲染时才求值，所以 goal_mode 关掉后下一轮就不再出现（不用重启）
+        get text() {
+          return runtime.enabled ? POLICY_SECTION : '';
+        },
       });
       try {
         if (typeof promptCtx.effect === 'function') promptCtx.effect(register, 'goal.loop.policy');
@@ -549,6 +586,28 @@ export function apply(ctx, config = {}) {
             '5) 命中红线直接列出 vetoes_hit，不要试图用高分盖过去。',
           ].join('\n'),
         }),
+      });
+      add({
+        definitionId: 'dsh-goal-loop/goal-mode',
+        name: 'goal-mode',
+        description: '切换目标工程模式：on 打开常驻闸门 / off 关掉 / 不带参数就是切换（输入框那个开关敲的也是这条）',
+        input: { hint: '[on|off|status]', attachments: false },
+        handler: async (invocation) => {
+          const arg = String(invocation?.rawInput ?? invocation?.text ?? '').trim().toLowerCase();
+          const cwd = modeCwd(invocation?.agent);
+          let next;
+          if (arg === 'status') next = runtime.enabled;
+          else if (arg === 'off' || arg === 'false' || arg === '0') next = false;
+          else if (arg === 'on' || arg === 'true' || arg === '1') next = true;
+          else next = !runtime.enabled;
+          await setMode(cwd, next, 'slash:/goal-mode');
+          return {
+            kind: 'success',
+            text: next
+              ? '目标工程：开。下一轮起，交付类任务会先 goal_define，说完成前要 goal_verdict 放行。'
+              : '目标工程：关。常驻闸门已撤，goal_* 工具仍在（想用就打 /goal）。',
+          };
+        },
       });
     });
   }
@@ -1354,6 +1413,48 @@ export function apply(ctx, config = {}) {
         ok: true,
         goals,
         message: [`目标台账（${goals.length} 个）：`, ...lines].join('\n'),
+      };
+    },
+  });
+
+  // 11) goal_mode：输入框那个开关的宿主侧落点（命令 /goal-mode 与它共享同一个状态）
+  ctx.tools.register({
+    name: 'goal_mode',
+    description:
+      '读或改「目标工程模式」。打开时常驻闸门（三层闸门那段）进系统提示，交付类任务会先 goal_define；关掉后闸门撤出提示，但 9 个 goal_* 工具仍在。输入框那排的开关、/goal-mode 命令与这个工具是同一个状态。不带 enabled 就是查状态。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        enabled: { type: 'boolean', description: 'true 打开常驻闸门；false 关掉；省略＝只查。' },
+        cwd: { type: 'string', description: '工作目录（省略用会话工作区）。' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'enabled', 'message'],
+        properties: {
+          ok: { type: 'boolean' },
+          enabled: { type: 'boolean', description: '当前是否打开。' },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const changed = typeof args.enabled === 'boolean';
+      if (changed) await setMode(cwd, args.enabled, 'tool:goal_mode');
+      return {
+        ok: true,
+        enabled: runtime.enabled,
+        message: changed
+          ? runtime.enabled
+            ? '目标工程：开（下一轮起常驻闸门进系统提示）。'
+            : '目标工程：关（下一轮起不再注入闸门；goal_* 工具仍在，想用就打 /goal）。'
+          : `目标工程：${runtime.enabled ? '开' : '关'}（未改动）。`,
       };
     },
   });

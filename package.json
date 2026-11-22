@@ -1,6 +1,6 @@
 {
   "name": "dsh-goal-loop",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "type": "module",
   "description": "目标工程三层闸门 for DeepSeek Harness：机器层（命令能判的全绿）+ 评审层（独立判分过线、无红线）+ 校准层（盲预测押注、判完对账、换尺子留理由）。",
   "main": "./index.mjs",
@@ -10,7 +10,8 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./lib/goal-core.mjs": "./lib/goal-core.mjs",
     "./lib/rubric-core.mjs": "./lib/rubric-core.mjs",
-    "./lib/calibration-core.mjs": "./lib/calibration-core.mjs"
+    "./lib/calibration-core.mjs": "./lib/calibration-core.mjs",
+    "./client": "./lib/client.js"
   },
   "files": [
     "index.mjs",
@@ -32,6 +33,13 @@
     "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
     }
   },
   "dshWorkshop": {
@@ -60,7 +68,7 @@
       "id": "goal-loop",
       "kind": "skill+tools+command",
       "invocation": "skill goal-loop / /goal / /review",
-      "expected": "技能目录出现 goal-loop（外加 goal-professor / goal-tutor / goal-reviewer 三个角色稿）；工具列表出现 goal_define / goal_check / goal_predict / goal_review / goal_retro / goal_verdict / goal_doctor / goal_status 八个工具；.goal/<id>/ 下落盘 goal.json / proof-N.json / predict-N.json / review-N.json / retro-N.json / gate.json；goal_define 在目标含「借鉴/参考/复刻」时会要求 provenance 与 refusals。"
+      "expected": "技能目录出现 goal-loop（外加 goal-professor / goal-tutor / goal-reviewer 三个角色稿）；工具列表出现 goal_define / goal_check / goal_predict / goal_review / goal_retro / goal_verdict / goal_doctor / goal_status / goal_mode 九个工具；.goal/<id>/ 下落盘 goal.json / proof-N.json / predict-N.json / review-N.json / retro-N.json / gate.json；goal_define 在目标含「借鉴/参考/复刻」时会要求 provenance 与 refusals。"
     }
   },
   "scripts": {
