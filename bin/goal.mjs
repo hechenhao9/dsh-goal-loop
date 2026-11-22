@@ -18,7 +18,25 @@ import os from 'node:os';
 import { normalizeContract, validateContract, runContract, summarize, renderReport, verdictLine } from '../lib/goal-core.mjs';
 import { saveContract, resolveContract, listGoals, saveProof, setStatus, loadContract } from '../lib/goal-store.mjs';
 import { normalizeRubric, validateRubric, validateReview, decide, decideLine } from '../lib/rubric-core.mjs';
-import { saveReview, loadLatestReview, loadLatestProof, saveGate } from '../lib/review-store.mjs';
+import {
+  saveReview,
+  loadLatestReview,
+  loadLatestProof,
+  saveGate,
+  savePrediction,
+  loadLatestPrediction,
+  listPredictions,
+  saveRetro,
+  listRetros,
+} from '../lib/review-store.mjs';
+import {
+  normalizePrediction,
+  sealPrediction,
+  validatePrediction,
+  compare,
+  biasStreak,
+  retroLine,
+} from '../lib/calibration-core.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const cwd = process.cwd();
@@ -113,6 +131,76 @@ async function main() {
       return 0;
     }
 
+    case 'predict': {
+      if (!rest[0]) die('用法：node bin/goal.mjs predict <predict.json> [id]');
+
+      const contract = await resolveContract(cwd, rest[1]);
+      const rubric = normalizeRubric(contract.rubric);
+
+      if (!rubric?.dims?.length) die('这个目标没有 rubric：没有维度就没法押注。');
+      const raw = rest[0] === '-' ? readFileSync(0, 'utf8') : readFileSync(path.resolve(cwd, rest[0]), 'utf8');
+      let input;
+      try {
+        input = JSON.parse(raw.replace(/^\uFEFF/, ''));
+      } catch (err) {
+        die(`预测 JSON 解析失败：${String(err)}`);
+      }
+
+      const pred = normalizePrediction(input);
+      const v = validatePrediction(pred, rubric);
+
+      if (!v.ok) {
+        console.error('预测被拒收（押注前先想清楚，不是写完再改）：');
+        for (const e of v.errors) console.error(`  ✗ ${e}`);
+        for (const w of v.warnings) console.error(`  ! ${w}`);
+        return 3;
+      }
+
+      const sealed = sealPrediction(pred);
+      let saved;
+      try {
+        saved = await savePrediction(cwd, contract, sealed);
+      } catch (err) {
+        console.error(err?.code === 'PREDICT_AFTER_REVIEW' ? err.message : String(err));
+        return 1;
+      }
+      for (const w of v.warnings) console.log(`! ${w}`);
+      console.log(`押注已封（第 ${saved.round} 轮）：${sealed.digest}`);
+      console.log(`  总分区间 ${sealed.bet.total_low}–${sealed.bet.total_high}｜依据 ${sealed.basis}`);
+      console.log('  封条一落就不可改——判完回来对账，改预测等于照着答案押注。');
+      console.log(`predict: ${saved.file}`);
+      return 0;
+    }
+
+    case 'retro': {
+      const contract = await resolveContract(cwd, rest[0]);
+      const rubric = normalizeRubric(contract.rubric);
+      if (!rubric?.dims?.length) die('这个目标没有 rubric：没有标准就没有偏差可言。');
+      const preds = await listPredictions(cwd, contract.id);
+
+      if (preds.length === 0) die('还没有押注，先 predict 再判分，否则对账无意义。', 1);
+      const targetRound = rest[1] ? Number(rest[1]) : null;
+      const predRec = targetRound
+        ? preds.find((p) => Number(p.round) === targetRound)
+        : preds[preds.length - 1];
+
+      if (!predRec) die(`没有第 ${targetRound} 轮的预测。`, 1);
+      const reviewRec = await loadLatestReview(cwd, contract.id).catch(() => null);
+
+      if (!reviewRec) die('还没有判分，无从对账：先 review。', 1);
+      const result = compare(predRec.prediction, reviewRec, rubric);
+      const saved = await saveRetro(cwd, contract, result, { round: predRec.round });
+      const retros = await listRetros(cwd, contract.id);
+      const streak = biasStreak(retros);
+      console.log(retroLine({ ...result, round: predRec.round }));
+      if (streak.warn) {
+        console.log(`\n注意：连续 ${streak.count} 轮同向偏差（${streak.direction}）。`);
+        console.log('  这说明标准本身有偏，不是稿子每次都错——改 criterion，并给 rubric_change_reason。');
+      }
+      console.log(`retro: ${saved.file}`);
+      return 0;
+    }
+
     case 'review': {
       if (!rest[0]) die('用法：node bin/goal.mjs review <review.json> [id]');
       const contract = await resolveContract(cwd, rest[1]);
@@ -161,10 +249,12 @@ async function main() {
 
     default:
       console.log(`用法：
-  node bin/goal.mjs status                 台账总览（机器层 + 评审层）
+  node bin/goal.mjs status                 台账总览（机器层 + 评审层 + 校准）
   node bin/goal.mjs check [id]             真跑机器层，落 proof
   node bin/goal.mjs define <file.json>     从 JSON 建/更新合约（- 或省略则读 stdin）
+  node bin/goal.mjs predict <file.json> [id]  判分前押注（落盘即封，不可改）
   node bin/goal.mjs review <file.json> [id]   提交判分，机器审计
+  node bin/goal.mjs retro [id] [round]     判完后对账：尺子偏高还是偏低
   node bin/goal.mjs verdict [id]           最终裁决（0 可交 / 1 不许交）
   node bin/goal.mjs demo                   跑一遍完整链路给你看
 
@@ -222,7 +312,23 @@ async function demo() {
   proof = await saveProof(dir, contract, results, { actor: 'demo' });
   console.log(`   ${verdictLine(results)}`);
 
-  console.log('\n③ 交一份转述的判分（预期被机器拒收）');
+  console.log('\n③ 判分之前先押注（盲预测，封了不可改）');
+  const prediction = sealPrediction(normalizePrediction({
+    predictor: 'demo-tutor',
+    basis: '引文是逐字抄的、M3 给了理由，按标准应当满分；风险在 M4 太短，可能被判没展开',
+    dims: [
+      { id: 'M1', expected: 10, why: '引文与原文一字不差' },
+      { id: 'M2', expected: 10, why: '命令可直接粘贴' },
+      { id: 'M3', expected: 10, why: '不支持项有理由' },
+      { id: 'M4', expected: 10, why: '每段首句即结论' },
+    ],
+    bet: { total_low: 95, total_high: 100, risk_dims: ['M4'] },
+  }));
+  const predSaved = await savePrediction(dir, contract, prediction);
+  console.log(`   封条 ${prediction.digest}｜押 ${prediction.bet.total_low}–${prediction.bet.total_high}`);
+  console.log(`   predict: ${rel(predSaved.file)}`);
+
+  console.log('\n④ 交一份转述的判分（预期被机器拒收）');
   const badReview = {
     reviewer: 'demo-reviewer',
     dims: [
@@ -238,7 +344,7 @@ async function demo() {
   console.log(`   审计：${audited.ok ? '过' : '拒收'}`);
   for (const e of audited.errors) console.log(`   ✗ ${e}`);
 
-  console.log('\n④ 改成逐字引文再交（预期过线）');
+  console.log('\n⑤ 改成逐字引文再交（预期过线）');
   const goodReview = JSON.parse(JSON.stringify(badReview));
   goodReview.dims[0].quote.text = '双层闸门的演示：这句话现在逐字存在，可以被引用。';
   goodReview.dims[3].quote.text = '结论先行：这份样本只演示机制，不承载真实结论。';
@@ -249,7 +355,16 @@ async function demo() {
   for (const e of audited.errors) console.log(`   ✗ ${e}`);
   console.log(`   review: ${rel(saved.file)}`);
 
-  console.log('\n⑤ 终局裁决');
+  console.log('\n⑥ 判完对账：尺子准不准，这一层才算学到东西');
+  const retro = compare(prediction, { ...goodReview, audited }, contract.rubric);
+  const retroSaved = await saveRetro(dir, contract, retro, { round: predSaved.round });
+  console.log(`   ${retroLine({ ...retro, round: predSaved.round })}`);
+  const retros = await listRetros(dir, contract.id);
+  const streak = biasStreak(retros);
+  console.log(`   连续同向偏差：${streak.warn ? `${streak.count} 轮 ${streak.direction}（该改标准了）` : '无'}`);
+  console.log(`   retro: ${rel(retroSaved.file)}`);
+
+  console.log('\n⑦ 终局裁决');
   const machineGreen = Boolean((await loadLatestProof(dir, contract.id))?.summary?.green);
   const reviewRec = await loadLatestReview(dir, contract.id);
   const verdict = decide({ machineGreen, rubric: contract.rubric, review: reviewRec?.audited ?? null });

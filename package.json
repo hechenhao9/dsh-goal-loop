@@ -1,15 +1,16 @@
 {
   "name": "dsh-goal-loop",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "目标工程双层闸门 for DeepSeek Harness：机器层（命令能判的全绿）+ 评审层（独立判分过线、无红线），两层都过才算能交。",
+  "description": "目标工程三层闸门 for DeepSeek Harness：机器层（命令能判的全绿）+ 评审层（独立判分过线、无红线）+ 校准层（盲预测押注、判完对账、换尺子留理由）。",
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./lib/goal-core.mjs": "./lib/goal-core.mjs",
-    "./lib/rubric-core.mjs": "./lib/rubric-core.mjs"
+    "./lib/rubric-core.mjs": "./lib/rubric-core.mjs",
+    "./lib/calibration-core.mjs": "./lib/calibration-core.mjs"
   },
   "files": [
     "index.mjs",
@@ -59,7 +60,7 @@
       "id": "goal-loop",
       "kind": "skill+tools+command",
       "invocation": "skill goal-loop / /goal / /review",
-      "expected": "技能目录出现 goal-loop（外加 goal-professor / goal-tutor / goal-reviewer 三个角色稿）；工具列表出现 goal_define / goal_check / goal_review / goal_verdict / goal_status；.goal/<id>/ 下落盘 goal.json、proof-N.json、review-N.json、gate.json"
+      "expected": "技能目录出现 goal-loop（外加 goal-professor / goal-tutor / goal-reviewer 三个角色稿）；工具列表出现 goal_define / goal_check / goal_predict / goal_review / goal_retro / goal_verdict / goal_status；.goal/<id>/ 下落盘 goal.json、predict-N.json、proof-N.json、review-N.json、retro-N.json、gate.json"
     }
   },
   "scripts": {
@@ -76,7 +77,9 @@
     "verification",
     "definition-of-done",
     "agent-evaluation",
-    "gate"
+    "gate",
+    "calibration",
+    "blind-prediction"
   ],
   "author": "hechenhao9",
   "license": "MIT",

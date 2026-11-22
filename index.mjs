@@ -55,6 +55,7 @@ import {
   validateReview,
   decide,
   decideLine,
+  scoreTotal,
   DEFAULT_BAR,
 } from './lib/rubric-core.mjs';
 import {
@@ -63,7 +64,24 @@ import {
   loadLatestProof,
   saveGate,
   reviewDir,
+  savePrediction,
+  loadLatestPrediction,
+  listPredictions,
+  saveRetro,
+  listRetros,
+  appendRubricHistory,
+  markReviewsStale,
+  saveReviewBrief,
 } from './lib/review-store.mjs';
+import {
+  normalizePrediction,
+  sealPrediction,
+  validatePrediction,
+  compare,
+  biasStreak,
+  validateRubricChange,
+  retroLine,
+} from './lib/calibration-core.mjs';
 
 /** Cordis 插件名。 */
 export const name = 'dsh-goal-loop';
@@ -80,12 +98,13 @@ const AGENT_DIR = fileURLToPath(new URL('./agents/', import.meta.url));
  * 刻意压短——它每一轮都要付费，只留判断权归属与最硬的四条。
  */
 const POLICY_SECTION = [
-  '【目标工程 · 双层闸门】判断权不归我：能不能交，不由我说。',
+  '【目标工程 · 三层闸门】判断权不归我：能不能交，不由我说；标准准不准，也不由我说。',
   '1) 交付类任务动手之前先 goal_define：objective（交付什么、给谁、什么规模）+ done_when（每条一个能真跑的命令）+ non_goals。',
   '   判不了好坏的质量维度另写 rubric（4–6 维、权重合计 100、每维有正反例、至少一条红线）。合约被拒收＝目标还不可验收，补全再落，不许"先干着看"。',
   '2) 动手，然后 goal_check 真跑；红灯只修红灯列出的那几条，修完必须重跑，不许换题。',
   '3) 有 rubric 的任务，判分必须由独立一方给（自己写的稿子自己打分不算），交 goal_review 让机器审计：引文逐字对、分数重算、扣分要能落成改法、命中红线即废。',
   '4) 说"完成／做好了／可以了"之前必须 goal_verdict 的 deliverable=true。没过就如实说差哪条、卡在哪。',
+  '5) 有 rubric 的任务，判分之前先 goal_predict 押注（每维押 0/4/7/10 + 总分区间 + 依据），封了不可改；判完 goal_retro 对账。连续三轮同向偏差＝错的是标准不是稿子，改 criterion 并给 rubric_change_reason，旧分作废重判。',
   '不建合约：纯问答、单点排错、闲聊——直接答，别为建合约而建合约。',
 ].join('\n');
 
@@ -230,7 +249,59 @@ const defineParameters = {
       },
     },
     id: { type: 'string', description: '更新既有目标时传同一个 id（revision 会自动 +1）；新建留空。' },
+    rubric_change_reason: {
+      type: 'string',
+      description: '更新已有目标且 rubric 变了时必填（≥12 字）：哪一维判错了、被什么证据推翻。不给就拒收——静默换尺子会让历史分数失去可比性。',
+    },
     cwd: { type: 'string', description: '工作区目录，省略用当前会话工作区。' },
+  },
+};
+
+/** goal_predict 参数。 */
+const predictParameters = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['dims', 'bet', 'basis'],
+  properties: {
+    id: { type: 'string', description: '目标 id，省略取最近一个未放弃的目标。' },
+    dims: {
+      type: 'array',
+      description: '每一维押一个分（0/4/7/10）。必须有 rubric 的全部维度，缺一维会被拒收。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'expected'],
+        properties: {
+          id: { type: 'string', description: '维度 id，如 M1。' },
+          expected: { type: 'number', description: '押它得几分：0 / 4 / 7 / 10。' },
+          why: { type: 'string', description: '为什么押这个分（可省，但省了对账时解释不了）。' },
+        },
+      },
+    },
+    bet: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['total_low', 'total_high'],
+      properties: {
+        total_low: { type: 'number', description: '押的总分下界。' },
+        total_high: { type: 'number', description: '押的总分上界。按维分算出的值必须落在这个区间里。' },
+        risk_dims: { type: 'array', items: { type: 'string' }, description: '你认为最可能掉分的维度 id。' },
+      },
+    },
+    basis: { type: 'string', description: '≥12 字：凭什么这么押（上次同类交付哪一维掉过分、这次靠什么补的）。' },
+    predictor: { type: 'string', description: '谁押的（如 tutor / 我）。不能与之后的判分人是同一个。' },
+    cwd: { type: 'string', description: '工作区目录。' },
+  },
+};
+
+/** goal_retro 参数。 */
+const retroParameters = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', description: '目标 id，省略取最近一个。' },
+    round: { type: 'number', description: '对哪一轮对账，省略取最近一份预测与判分。' },
+    cwd: { type: 'string', description: '工作区目录。' },
   },
 };
 
@@ -275,6 +346,12 @@ const verdictParameters = {
 function readJsonFile(file) {
   const raw = readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
   return JSON.parse(raw);
+}
+
+/** 按押的各维分算总分（只用于提示文案）。 */
+function scoreTotalSafe(rubric, dims) {
+  const scores = Object.fromEntries(dims.map((d) => [d.id, d.expected]));
+  return scoreTotal(rubric, scores).total;
 }
 
 /** 解析 rubric：内联优先，其次文件。 */
@@ -331,7 +408,7 @@ export function apply(ctx) {
       try {
         const { description, content } = readSkill(
           SKILL_FILE,
-          '目标工程双层闸门：机器层全绿 + 独立评审过线，两层都过才算能交。',
+          '目标工程三层闸门：机器层全绿 + 独立评审过线 + 盲预测校准无连续偏差，才叫能交。',
         );
         register({
           name: SKILL_NAME,
@@ -481,6 +558,16 @@ export function apply(ctx) {
       const warnings = [...verdict.warnings, ...rubricWarnings];
       const gated = Boolean(rubric?.dims?.length);
 
+      // 换尺子的刹车：判据变了必须给理由，且旧分要作废。
+      const prevRubric = prev?.rubric?.dims?.length ? normalizeRubric(prev.rubric) : null;
+      const change = prevRubric && rubric
+        ? validateRubricChange(prevRubric, rubric, args.rubric_change_reason)
+        : null;
+      if (change?.changed) {
+        errors.push(...change.errors);
+        warnings.push(...change.warnings);
+      }
+
       if (errors.length) {
         return {
           ok: false,
@@ -494,6 +581,19 @@ export function apply(ctx) {
       }
 
       const { dir } = await saveContract(cwd, contract, { actor: 'goal_define', note: prev ? 'update' : 'create' });
+      let staleRounds = [];
+      if (change?.changed) {
+        await appendRubricHistory(cwd, contract, prevRubric, rubric, args.rubric_change_reason, change.diff);
+        staleRounds = await markReviewsStale(cwd, contract.id, 'rubric 已更新');
+      }
+      const changeNote = change?.changed
+        ? ` 判据已换（${[
+          change.diff.added.length ? `+${change.diff.added.join('/')}` : '',
+          change.diff.removed.length ? `-${change.diff.removed.join('/')}` : '',
+          change.diff.changed.length ? `~${change.diff.changed.map((c) => c.id).join('/')}` : '',
+          change.diff.bar ? `bar ${change.diff.bar.from}→${change.diff.bar.to}` : '',
+        ].filter(Boolean).join(' ') || '措辞微调'}）${staleRounds.length ? `，${staleRounds.length} 份旧判分已标 stale，不可与新旧混算` : ''}。`
+        : '';
       return {
         ok: true,
         id: contract.id,
@@ -502,8 +602,8 @@ export function apply(ctx) {
         warnings,
         gated,
         message: gated
-          ? `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收 + ${rubric.dims.length} 维评审，合格线 ${rubric.bar}）。下一步动手，然后 goal_check。`
-          : `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收，无评审层）。下一步动手，然后 goal_check。`,
+          ? `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收 + ${rubric.dims.length} 维评审，合格线 ${rubric.bar}）。下一步：先 goal_predict 押注，再动手，然后 goal_check。${changeNote}`
+          : `目标已落盘：${contract.id}（${contract.done_when.length} 条机器验收，无评审层）。下一步动手，然后 goal_check。${changeNote}`,
       };
     },
   });
@@ -635,6 +735,43 @@ export function apply(ctx) {
       }
 
       const audited = validateReview(review, rubric, cwd);
+
+      // 盲预测的完整性：押注人和判分人不能是同一个。
+      // 同一个人的「我押 96」和「我给 97」不是两个信号，是一个信号说了两遍。
+      const pred = await loadLatestPrediction(cwd, contract.id).catch(() => null);
+      const roster = (v) => String(v ?? '').trim().toLowerCase();
+      if (pred?.predictor && roster(pred.predictor) === roster(review.reviewer) && roster(pred.predictor) !== '') {
+        audited.errors.push(
+          `押注人（${pred.predictor}）和判分人（${review.reviewer}）是同一个：盲预测要用在「押的人不知道判的人会给几分」，`
+          + '同一个人两边都是他，对账就成了自己核对自己的预期。换一个人押，或者换一个人判。',
+        );
+        audited.ok = false;
+        audited.deliverable = false;
+      } else if (!pred) {
+        audited.warnings.push('这次判分没有对应的盲预测：能判，但对账时学不到「标准准不准」这一层。下次先 goal_predict。');
+      }
+
+      const brief = {
+        goal: contract.id,
+        objective: contract.objective,
+        rubric,
+        bar: rubric.bar,
+        must_read: [...new Set((review.dims ?? [])
+          .map((d) => String(d?.quote?.file ?? '').trim())
+          .filter(Boolean))],
+        must_not_read: [
+          `.goal/${contract.id}/predict-*.json`,
+          `.goal/${contract.id}/review-*.json`,
+          `.goal/${contract.id}/retro-*.json`,
+          `.goal/${contract.id}/gate.json`,
+          `.goal/${contract.id}/journal.jsonl`,
+          `.goal/${contract.id}/proof-*.json`,
+        ],
+        note: '判分人只读 must_read 里的作品与 rubric。看过历史分数或预测，判断就从独立评审退化成对答案的拟合。',
+        generated_at: new Date().toISOString(),
+      };
+      const briefFile = await saveReviewBrief(cwd, contract, brief);
+
       const { file } = await saveReview(cwd, contract, { ...review, audited }, { actor: 'goal_review' });
       const pass = audited.ok && audited.deliverable;
       return {
@@ -648,13 +785,192 @@ export function apply(ctx) {
         warnings: audited.warnings,
         file,
         message: audited.deliverable
-          ? `判分通过：${audited.total} ≥ ${rubric.bar}，无红线。${audited.warnings.length ? `（${audited.warnings.length} 条提醒）` : ''} 还差机器层：调 goal_verdict 看终局。`
+          ? `判分通过：${audited.total} ≥ ${rubric.bar}，无红线。${audited.warnings.length ? `（${audited.warnings.length} 条提醒）` : ''} 还差机器层与对账：调 goal_verdict 看终局，调 goal_retro 看尺子准不准。任务书在 ${briefFile.file}。`
           : `判分未通过：${audited.errors[0] ?? `总分 ${audited.total} 未达 ${rubric.bar}`}${audited.errors.length > 1 ? `（共 ${audited.errors.length} 项）` : ''}`,
       };
     },
   });
 
-  // 6) goal_verdict
+  // 6) goal_predict —— 判分之前押注（盲预测）
+  ctx.tools.register({
+    name: 'goal_predict',
+    description:
+      '判分之前押注：给 rubric 的每一维押一个分（0/4/7/10）、押一个总分区间、写清依据。落盘即封（sealed_at + 摘要），同一轮不可覆盖，判过分之后补预测会被拒收。它的用途是给「标准本身准不准」留一份对账凭据——没有预测，评审层过了 95 也只是一个数字。',
+    parameters: predictParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'id', 'round', 'sealed_at', 'digest', 'errors', 'warnings', 'file', 'message'],
+        properties: {
+          ok: { type: 'boolean' },
+          id: { type: 'string' },
+          round: { type: 'number' },
+          sealed_at: { type: 'string' },
+          digest: { type: 'string', description: '预测内容摘要，对账时用它确认押注没被改过。' },
+          errors: { type: 'array', items: { type: 'string' } },
+          warnings: { type: 'array', items: { type: 'string' } },
+          file: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const contract = await resolveContract(cwd, String(args.id ?? '').trim() || undefined);
+      const rubric = normalizeRubric(contract.rubric) ?? null;
+      if (!rubric) {
+        return {
+          ok: false, id: contract.id, round: 0, sealed_at: '', digest: '', errors: ['这个目标没有 rubric，没有可押的标准。'],
+          warnings: [], file: '', message: '拒收：无评审层的目标不需要预测。',
+        };
+      }
+      const pred = normalizePrediction({
+        predictor: args.predictor,
+        basis: args.basis,
+        dims: args.dims,
+        bet: args.bet,
+      });
+      const v = validatePrediction(pred, rubric);
+      if (!v.ok) {
+        return {
+          ok: false, id: contract.id, round: 0, sealed_at: '', digest: '', errors: v.errors,
+          warnings: v.warnings, file: '', message: `预测被拒收（${v.errors.length} 项）：${v.errors[0]}`,
+        };
+      }
+      const sealed = sealPrediction(pred, new Date());
+      try {
+        const { file, round } = await savePrediction(cwd, contract, sealed);
+        const risk = sealed.bet.risk_dims.length ? `，最担心 ${sealed.bet.risk_dims.join('/')}` : '';
+        return {
+          ok: true, id: contract.id, round, sealed_at: sealed.sealed_at, digest: sealed.digest,
+          errors: [], warnings: v.warnings, file,
+          message: `押注已封（第 ${round} 轮，digest ${sealed.digest}）：${sealed.dims.length} 维共押 ${scoreTotalSafe(rubric, sealed.dims)}，区间 ${sealed.bet.total_low}–${sealed.bet.total_high}${risk}。去判分，判完调 goal_retro。`,
+        };
+      } catch (error) {
+        if (error?.code === 'PREDICT_AFTER_REVIEW') {
+          return {
+            ok: false, id: contract.id, round: 0, sealed_at: '', digest: '', errors: [String(error.message)],
+            warnings: [], file: '', message: `拒收：${String(error.message)}`,
+          };
+        }
+        throw error;
+      }
+    },
+  });
+
+  // 7) goal_retro —— 判分之后对账
+  ctx.tools.register({
+    name: 'goal_retro',
+    description:
+      '把盲预测与实际判分逐维对账：押了多少、实际多少、差多少、尺子偏高还是偏低、连续几轮同向。bias=over 表示标准把稿子想得比实际好（该收紧 criterion）；连续三轮同向＝改标准，不许再改稿。它不改分数、不改合约，只记账。',
+    parameters: retroParameters,
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'id', 'round', 'bias', 'hit_rate', 'streak', 'warn_standard', 'dims', 'total', 'line', 'file', 'message'],
+        properties: {
+          ok: { type: 'boolean' },
+          id: { type: 'string' },
+          round: { type: 'number' },
+          bias: { type: 'string', description: 'over / under / mixed / none。' },
+          hit_rate: { type: ['number', 'null'] },
+          streak: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['streak', 'dir', 'limit', 'warn'],
+            properties: {
+              streak: { type: 'number' },
+              dir: { type: ['string', 'null'] },
+              limit: { type: 'number' },
+              warn: { type: 'boolean' },
+            },
+          },
+          warn_standard: { type: 'boolean', description: '是否到了「该改标准而不是改稿」的时候。' },
+          dims: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'predicted', 'actual', 'delta', 'dir'],
+              properties: {
+                id: { type: 'string' },
+                predicted: { type: ['number', 'null'] },
+                actual: { type: ['number', 'null'] },
+                delta: { type: ['number', 'null'] },
+                dir: { type: 'string' },
+              },
+            },
+          },
+          total: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['predicted', 'actual', 'delta', 'in_bet'],
+            properties: {
+              predicted: { type: ['number', 'null'] },
+              actual: { type: ['number', 'null'] },
+              delta: { type: ['number', 'null'] },
+              in_bet: { type: 'boolean' },
+            },
+          },
+          line: { type: 'string' },
+          file: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.message }],
+    },
+    async execute(args, exec) {
+      const cwd = await resolveCwd(ctx, args.cwd, exec);
+      const contract = await resolveContract(cwd, String(args.id ?? '').trim() || undefined);
+      const rubric = normalizeRubric(contract.rubric) ?? null;
+      const fail = (message) => ({
+        ok: false, id: contract.id, round: 0, bias: 'none', hit_rate: null,
+        streak: { streak: 0, dir: null, limit: 3, warn: false }, warn_standard: false,
+        dims: [], total: { predicted: null, actual: null, delta: null, in_bet: false },
+        line: '', file: '', message,
+      });
+      if (!rubric) return fail('这个目标没有 rubric：没有标准就没有可对账的东西。');
+
+      const wantRound = Number(args.round) || 0;
+      const preds = await listPredictions(cwd, contract.id);
+      const reviewRec = await loadLatestReview(cwd, contract.id).catch(() => null);
+      const pred = wantRound ? preds.find((p) => p.round === wantRound) : preds.at(-1);
+      if (!pred) return fail('还没有盲预测：先在判分之前 goal_predict。判完再补预测等于照着答案押注。');
+      if (!reviewRec || !reviewRec.audited) return fail(`第 ${pred.round} 轮押了注但还没有判分：先 goal_review，再来对账。`);
+      if (wantRound && reviewRec.round !== wantRound && pred.round !== reviewRec.round) {
+        return fail(`第 ${wantRound} 轮的预测找不到对应的第 ${wantRound} 轮判分（现有判分第 ${reviewRec.round} 轮）。`);
+      }
+
+      const result = compare(pred, reviewRec, rubric);
+      const retros = await listRetros(cwd, contract.id);
+      const prior = retros.filter((r) => r.round !== pred.round);
+      const streak = biasStreak([...prior, { bias: result.bias }]);
+      const { file } = await saveRetro(cwd, contract, { ...result, streak }, { round: pred.round, actor: 'goal_retro' });
+      const line = retroLine(result);
+
+      return {
+        ok: true,
+        id: contract.id,
+        round: pred.round,
+        bias: result.bias,
+        hit_rate: result.hit_rate,
+        streak,
+        warn_standard: streak.warn,
+        dims: result.dims.map((d) => ({ id: d.id, predicted: d.predicted, actual: d.actual, delta: d.delta, dir: d.dir })),
+        total: { predicted: result.total.predicted, actual: result.total.actual, delta: result.total.delta, in_bet: result.total.in_bet },
+        line,
+        file,
+        message: streak.warn
+          ? `${line} 连续 ${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}——该改的是 criterion，不是继续改稿：带 rubric_change_reason 调 goal_define，旧判分会自动标 stale。`
+          : `${line} 还算稳（连续 ${streak.streak} 轮同向开始触发改标准提醒）。`,
+      };
+    },
+  });
+
+  // 8) goal_verdict
   ctx.tools.register({
     name: 'goal_verdict',
     description:
@@ -691,12 +1007,23 @@ export function apply(ctx) {
 
       const verdict = decide({ machineGreen, rubric, review: audited });
       if (!proof) verdict.reasons.unshift('还没有跑过 goal_check');
+
+      // 校准提醒：不改裁决，但要在同一句里说清「尺子可能歪了」。
+      const retros = await listRetros(cwd, contract.id).catch(() => []);
+      const streak = biasStreak(retros);
+      if (streak.warn) {
+        verdict.reasons.push(
+          `连续 ${streak.streak} 轮${streak.dir === 'over' ? '高估' : '低估'}：这次的具体分数没问题，但标准本身可能有偏，改 criterion 而不是继续改稿。`,
+        );
+      }
+
       const { file } = await saveGate(cwd, contract, {
         ...verdict,
         id: contract.id,
         machine_green: machineGreen,
         proof: proof ? proof.file ?? null : null,
         review: reviewRec ? reviewRec.file ?? null : null,
+        bias_streak: streak,
         at: new Date().toISOString(),
       });
 
@@ -718,7 +1045,7 @@ export function apply(ctx) {
     },
   });
 
-  // 7) goal_status
+  // 9) goal_status
   ctx.tools.register({
     name: 'goal_status',
     description:
@@ -747,6 +1074,15 @@ export function apply(ctx) {
         const gated = Boolean(c.rubric?.dims?.length);
         const bar = gated ? c.rubric.bar : null;
         const total = reviewRec?.audited?.total ?? null;
+        const retros = await listRetros(cwd, id).catch(() => []);
+        const pred = await loadLatestPrediction(cwd, id).catch(() => null);
+        const streak = biasStreak(retros);
+        const calib = !gated
+          ? '无评审层，无需校准'
+          : pred
+            ? `${retros.length ? retroLine(retros.at(-1)) : '已押注未对账'}${streak.warn ? `［连续 ${streak.streak} 轮同向，该改标准］` : ''}`
+            : '未押注（下一轮判分前先 goal_predict）';
+        const staleCount = reviewRec?.stale ? 1 : 0;
         return {
           ok: true,
           goals: [{
@@ -755,9 +1091,11 @@ export function apply(ctx) {
             review_dir: reviewDir(cwd, id),
             rubric_bar: bar,
             review_total: total,
+            calibration: { predicted: Boolean(pred), retro_rounds: retros.length, bias: retros.at(-1)?.bias ?? null, streak },
+            review_stale: Boolean(reviewRec?.stale),
             ...(goals[0] ?? {}),
           }],
-          message: `${c.id}：${c.objective}（机器层 ${c.done_when.length} 条，最近一轮 ${describeProof(goals[0])}${gated ? `；评审层 ${c.rubric.dims.length} 维，合格线 ${bar}，最近判分 ${total === null ? '未判' : total}` : '；无评审层'}）`,
+          message: `${c.id}：${c.objective}（机器层 ${c.done_when.length} 条，最近一轮 ${describeProof(goals[0])}${gated ? `；评审层 ${c.rubric.dims.length} 维，合格线 ${bar}，最近判分 ${total === null ? '未判' : total}${staleCount ? '（已标 stale，判据换过）' : ''}；校准 ${calib}` : '；无评审层'}）`,
         };
       }
       const goals = await listGoals(cwd);
@@ -769,9 +1107,17 @@ export function apply(ctx) {
         const reviewRec = await loadLatestReview(cwd, g.id).catch(() => null);
         const gated = Boolean(g.rubric?.dims?.length);
         const reviewPart = gated
-          ? `｜评审 ${reviewRec?.audited?.total ?? '未判'}/${g.rubric.bar}`
+          ? `｜评审 ${reviewRec?.audited?.total ?? '未判'}/${g.rubric.bar}${reviewRec?.stale ? '（stale）' : ''}`
           : '｜无评审层';
-        lines.push(`- ${g.id} [${g.status}] ${g.objective} → ${describeProof(g)}${reviewPart}`);
+        let calibPart = '';
+        if (gated) {
+          const retros = await listRetros(cwd, g.id).catch(() => []);
+          const pred = await loadLatestPrediction(cwd, g.id).catch(() => null);
+          calibPart = pred
+            ? `｜校准 ${retros.length ? `bias=${retros.at(-1)?.bias ?? 'none'}×${retros.length}` : '已押未对账'}`
+            : '｜未押注';
+        }
+        lines.push(`- ${g.id} [${g.status}] ${g.objective} → ${describeProof(g)}${reviewPart}${calibPart}`);
       }
       return {
         ok: true,

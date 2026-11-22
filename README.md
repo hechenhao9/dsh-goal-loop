@@ -2,7 +2,7 @@
 
 **把「做完了」变成一件能验的事。**
 
-一个双层闸门：**能用命令验的判据由机器 0 容忍把关，判不了好坏的质量由盲标准 + 外部判分把关**，两层都过才叫交付。
+一个双层闸门：**能用命令验的判据由机器 0 容忍把关，判不了好坏的质量由盲标准 + 外部判分把关**，两层都过才叫交付。**标准自己准不准，由盲预测与对账守住。**
 
 这是 `dsh-goal-engineering`（机器层）与 `dsh-judge-loop`（评审层）合体后的下一代。前两个各自解决一半问题，也各自留了一个洞——这份插件把两个洞互相堵上。
 
@@ -57,7 +57,32 @@
 
 ---
 
-## 四、装上就能用
+## 四、第三层：校准——尺子自己准不准
+
+前两层验的是「东西对不对」。这一层验的是**标准对不对**。
+
+一个偏松的 rubric 会让你连续十次报满分，而每次都很自信——分数是真的，标准是错的。这一层把「标准会不会偏」也变成可查的账。
+
+| 步骤 | 工具 | 硬规则 |
+|---|---|---|
+| 判分前押注 | `goal_predict` | 每维押 0/4/7/10 + 总分区间 + 依据（≥12 字）；**落盘即封**，带 digest，改不了 |
+| 判分 | `goal_review` | 押注人与判分人同名 → 当场拒收（自己押自己判等于没有校准） |
+| 判完对账 | `goal_retro` | 逐维 `delta = 实际 − 押注`；`delta < 0` 是高估，`> 0` 是低估 |
+| 连续 3 轮同向 | `goal_define` | 该改的是 `criterion`，不是继续改稿；改尺子必须给 `rubric_change_reason`（≥12 字） |
+
+三条不许绕的规矩：
+
+1. **预测 immutable**——判过分再补预测，等于照着答案押注。轮次时间戳由机器比，补的会被拒（`PREDICT_AFTER_REVIEW`）。
+2. **换尺子要留理由**——改 rubric 不给理由，`goal_define` 直接拒收；删维必须解释为什么删。理由写进 `rubric-history.jsonl`，只增不改。
+3. **旧分标 stale 不删**——判据改了，旧判分被标记 `stale` 并写明原因，但记录留着。删掉就等于这次偏差没发生过。
+
+**本插件不替你重判历史样本。** 标了 stale 之后要不要重打分、能不能和新分比，由你决定；机器只保证新分不会被当成和旧分可比。
+
+> 这套来自 `cheat-on-content` 的三条原则：盲预测不可改、升级要全量重判、尺子是工作台不是博物馆。本插件只搬了**能够机器强制的那部分**（封条、时间戳、stale 标记、换尺子理由），重打分与跨模型复核没有代做。
+
+---
+
+## 五、装上就能用
 
 ### 在 DSH 里（推荐）
 
@@ -69,7 +94,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 - 常驻行为协议 `goal-loop`（不用点名，模型自己在该建合约时会建）
 - 三个角色稿：`goal-professor`（只定标准，不看稿）/ `goal-tutor`（按标准做到位）/ `goal-reviewer`（独立判分）
-- 5 个工具：`goal_define`、`goal_check`、`goal_review`、`goal_verdict`、`goal_status`
+- 7 个工具：`goal_define`、`goal_check`、`goal_predict`、`goal_review`、`goal_retro`、`goal_verdict`、`goal_status`
 - 2 个命令：`/goal`、`/review`
 
 ### 不开 DSH 也能用（CLI 兜底）
@@ -78,14 +103,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 node bin/goal.mjs demo                              # 看它怎么工作（真跑，不是动画）
 node bin/goal.mjs define goal.json                  # 建合约（默认读 stdin）
 node bin/goal.mjs check                             # 跑机器层，落 proof
+node bin/goal.mjs predict predict.json              # 判分前押注（封了不可改）
 node bin/goal.mjs review review-1.json              # 提交判分，机器审计
+node bin/goal.mjs retro                             # 判完对账：尺子偏高还是偏低
 node bin/goal.mjs verdict                           # 终局：0=可以交 1=不许交
 node bin/goal.mjs status                            # 台账总览
 ```
 
 ---
 
-## 五、一份合约长什么样
+## 六、一份合约长什么样
 
 纯工程任务（没有质量判断，只有能跑通/跑不通）：
 
@@ -136,7 +163,7 @@ node bin/goal.mjs status                            # 台账总览
 
 ---
 
-## 六、三个角色，三条禁令
+## 七、三个角色，三条禁令
 
 | 角色 | 只做这件事 | 绝对不许 |
 |---|---|---|
@@ -148,7 +175,7 @@ node bin/goal.mjs status                            # 台账总览
 
 ---
 
-## 七、红灯驱动，不是绿灯驱动
+## 八、红灯驱动，不是绿灯驱动
 
 ```
 goal_define（不合格直接拒收，不落盘）
@@ -168,7 +195,7 @@ goal_verdict（两层合判：机器全绿 && 评审过线 && 无红线 → 可�
 
 ---
 
-## 八、和前两代的关系
+## 九、和前两代的关系
 
 **从 `goal-engineering` 继承**：`done_when` 的六种 `expect`、串行执行、`unknown` 不算绿、`green = 全 pass 且无 unknown` 的唯一定义、红灯驱动循环。
 
@@ -178,30 +205,33 @@ goal_verdict（两层合判：机器全绿 && 评审过线 && 无红线 → 可�
 
 ---
 
-## 九、它不管什么（诚实边界）
+## 十、它不管什么（诚实边界）
 
-- **判据本身可以写歪。** 机器只保证「写下的判据被严格执行」，保证不了判据值得写。标准写得差，执行得再严也白费。
+- **判据本身可以写歪。** 机器只保证「写下的判据被严格执行」，保证不了判据值得写。标准写得差，执行得再严也白费。校准层能告诉你「偏了」，但改不改由你决定。
 - **教授和导师可能是同一个模型。** 靠「不许看稿」这一道 prompt 隔开，不是真的组织隔离。
-- **`rubric` 是磁盘上的 JSON，人能改。** 改过就要重判（`review` 会记录轮次与时间，但拦不住手改）。
+- **`rubric` 是磁盘上的 JSON，人能改。** 改过要重判；`goal_define` 会要求给理由并留下 `rubric-history.jsonl`，但拦不住有人直接改文件。
 - **过了 95 不等于真的好评。** 它只说明「按这份标准做到了 95」。
 - **红线靠人识别。** 机器只能核你写进 `vetoes_hit` 的东西，不会自己发现「这句是编的」。
+- **校准层不重判历史样本。** 换尺子之后旧分标 `stale`，要不要重打分是本插件刻意不做的事——它只保证新分不会被误当成与旧分可比。
+- **预测可以押得敷衍。** 机器能核「有没有押、押得全不全、和实际差多少」，核不了「押的时候是不是真在想」。连续偏差会暴露敷衍，但那已经晚了三轮。
 
 ---
 
-## 十、目录
+## 十一、目录
 
 ```
-index.mjs                入口：注册 4 技能 / 5 工具 / 2 命令 / 常驻协议
+index.mjs                入口：注册 4 技能 / 7 工具 / 2 命令 / 常驻协议
 skill/goal-loop.md       主协议（行为准则，模型自动遵守）
 agents/professor.md      定标准的人（不看稿）
-agents/tutor.md          干活的人（不改标准）
+agents/tutor.md          干活的人（不改标准，判分前先押注）
 agents/reviewer.md       判分的人（不算总分）
 lib/goal-core.mjs        机器层纯逻辑：合约规整/校验/执行/判定
 lib/rubric-core.mjs      评审层纯逻辑：rubric 校验/引文核对/分数重算/终局
+lib/calibration-core.mjs 校准层纯逻辑：封预测/对账/偏差连续/换尺子刹车
 lib/goal-store.mjs       机器层台账 IO
-lib/review-store.mjs     评审层台账 IO
-bin/goal.mjs             CLI：define/check/review/verdict/status/demo
-test/                    45 条单测（node --test）
+lib/review-store.mjs     评审层与校准层台账 IO
+bin/goal.mjs             CLI：define/check/predict/review/retro/verdict/status/demo
+test/                    74 条单测（node --test）
 ```
 
 跑测试：

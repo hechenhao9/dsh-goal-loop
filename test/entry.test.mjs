@@ -57,12 +57,12 @@ test('入口导出形态正确', () => {
   assert.equal(typeof apply, 'function');
 });
 
-test('apply 注册 5 个工具 + 4 技能 + 2 命令', () => {
+test('apply 注册 7 个工具 + 4 技能 + 2 命令', () => {
   const { ctx, tools, skills, commands } = fakeCtx();
   apply(ctx);
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
-    ['goal_check', 'goal_define', 'goal_review', 'goal_status', 'goal_verdict'],
+    ['goal_check', 'goal_define', 'goal_predict', 'goal_retro', 'goal_review', 'goal_status', 'goal_verdict'],
   );
   for (const t of tools) {
     assert.equal(typeof t.execute, 'function');
@@ -76,7 +76,7 @@ test('apply 注册 5 个工具 + 4 技能 + 2 命令', () => {
   );
   const main = skills.find((s) => s.name === 'goal-loop');
   assert.ok(main.description.length > 10);
-  assert.ok(main.content.includes('双层闸门'));
+  assert.ok(main.content.includes('三层闸门'));
   assert.equal(commands.length, 2);
   assert.deepEqual(commands.map((c) => c.name).sort(), ['goal', 'review']);
 });
@@ -89,8 +89,8 @@ test('apply 注册常驻政策段到 systemPrompt', () => {
   assert.equal(sections[0].order, 10, '借用 TOOL_GOAL 的 order，不自己排序');
   assert.match(sections[0].text, /goal_check/);
   assert.match(sections[0].text, /goal_verdict/);
-  assert.match(sections[0].text, /双层闸门/);
-  assert.ok(sections[0].text.length < 900, `政策段每轮付费，必须压短（当前 ${sections[0].text.length} 字）`);
+  assert.match(sections[0].text, /三层闸门/);
+  assert.ok(sections[0].text.length < 1200, `政策段每轮付费，必须压短（当前 ${sections[0].text.length} 字）`);
 });
 
 test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', () => {
@@ -101,7 +101,7 @@ test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', ()
     logger: { warn: () => {} },
   };
   assert.doesNotThrow(() => apply(ctx));
-  assert.equal(tools.length, 5);
+  assert.equal(tools.length, 7);
 });
 
 test('端到端：define(rubric) → check → review → verdict', async () => {
