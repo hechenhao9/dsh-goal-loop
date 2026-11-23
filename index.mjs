@@ -204,6 +204,95 @@ async function setMode(cwd, enabled, by) {
   return runtime.enabled;
 }
 
+/** 输入框那个 pill 读写的路由（同源，浏览器一半只认这个）。 */
+const STATE_ROUTE = '/dsh-goal-loop/state';
+
+/**
+ * 给浏览器那一半开一个状态路由：`GET` 读、`POST {enabled}` 写。
+ *
+ * 不走命令系统——命令目录刷新是另一条链路，开关不该被它卡住。
+ * 与 `dsh-windows-mcp` 的 pill 同一套契约：宿主是唯一真相，写失败客户端自己回滚。
+ * @param {object} ctx
+ * @param {(stage: string, detail?: string) => void} boot 启动回执（apply 里定义的局部函数）
+ */
+function registerStateRoute(ctx, boot = () => {}) {
+  if (typeof ctx?.inject !== 'function') return;
+  try {
+    ctx.inject(['webServer'], (scoped) => {
+      try {
+        if (typeof scoped?.webServer?.register !== 'function') {
+          boot('route:missing');
+          return;
+        }
+
+        const respond = (response, status, body) => {
+          try {
+            const payload = JSON.stringify(body);
+            response.writeHead(status, {
+              'content-type': 'application/json; charset=utf-8',
+              'cache-control': 'no-store',
+              'content-length': Buffer.byteLength(payload),
+            });
+            response.end(payload);
+          } catch {
+            /* 对端可能已经断开 */
+          }
+        };
+
+        const snapshot = () => ({
+          enabled: runtime.enabled,
+          route: STATE_ROUTE,
+        });
+
+        const handler = (request, response) => {
+          if (request.method === 'GET') {
+            respond(response, 200, snapshot());
+            return;
+          }
+          if (request.method !== 'POST') {
+            respond(response, 405, { error: 'method not allowed' });
+            return;
+          }
+          const chunks = [];
+          let size = 0;
+          request.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > 8192) {
+              request.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
+          request.on('end', () => {
+            let next;
+            try {
+              next = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            } catch {
+              respond(response, 400, { error: 'invalid JSON body' });
+              return;
+            }
+            if (typeof next?.enabled !== 'boolean') {
+              respond(response, 400, { error: 'expected { enabled: boolean }' });
+              return;
+            }
+            void setMode(process.cwd(), next.enabled, 'pill')
+              .then(() => respond(response, 200, snapshot()))
+              .catch((error) => respond(response, 500, { error: String(error?.message ?? error) }));
+          });
+          request.on('error', () => respond(response, 400, { error: 'request failed' }));
+        };
+
+        scoped.webServer.register({ kind: 'exact', path: STATE_ROUTE, handler });
+        boot('route:ok', STATE_ROUTE);
+      } catch (error) {
+        boot('route:failed', String(error?.message ?? error));
+      }
+    });
+  } catch (error) {
+    boot('route:failed', String(error?.message ?? error));
+  }
+}
+
 /** 工具共用：done_when 的参数 schema。 */
 const doneWhenSchema = {
   type: 'array',
@@ -1499,6 +1588,9 @@ export function apply(ctx, config = {}) {
 
       boot('apply:exit', 'tools=9');
     });
+
+    // 输入框那个 pill 走自己的路由，不依赖命令目录刷新。
+    registerStateRoute(ctx, boot);
   }
 }
 

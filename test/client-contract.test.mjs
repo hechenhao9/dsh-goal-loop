@@ -1,15 +1,19 @@
-// 客户端 bundle 的安全约束：这些断言来自两次真实启动事故，不要放宽。
+// 客户端 bundle 的安全约束：这些断言来自三次真实启动事故，不要放宽。
 //
 // 事故 1（1.3.0，`pending`）：
-//   dsh.client.inject 写了两个内置包名当服务名 → boot 一直等，等不到
+//   dsh.client.inject 写了两个**包名**当服务名 → cordis 等一个不存在的服务
 //   → `web boot: 1 entry did not activate` → dsh-goal-loop: pending → DSH 打不开
 //
 // 事故 2（1.3.1，`loading`）：
 //   inject 清空后调 ctx.slots.inject('conversation.input.dock', …)，外部 bundle
 //   没声明该槽所属服务，槽不出现 → Promise 永不 resolve → entry 卡 loading → 同样起不来
 //
-// 现行方案（1.4.0）：照抄本机已跑通的 dsh-sidebar-fold —— 纯 DOM，inject 为空，
-// 不碰 ctx.slots / ctx.remote，整个 apply 包 try/catch。最坏结果是「按钮不出现」。
+// 事故 3（1.4.x，DOM 版能启动但按钮不出现 / 点击无效）：
+//   纯 DOM 找输入框靠猜选择器，DSH 一改版就失准
+//
+// 现行方案（1.6.0）：照抄本机已跑通的 `dsh-windows-mcp` pill ——
+//   inject = ["slots"]（唯一确定存在的服务）、槽用 `conversation.input.left`、
+//   状态走自家 HTTP 路由（GET/POST `/dsh-goal-loop/state`）、不碰 ctx.remote。
 // 下面这些断言就是为了让这条边界不被下次改坏。
 
 import { test } from 'node:test';
@@ -37,51 +41,70 @@ test('manifest：dsh.client.platform 是 web', () => {
   assert.equal(pkg.dsh?.client?.platform, 'web');
 });
 
-test('manifest：dsh.client.inject 必须缺席或为空（否则 boot 会 pending）', () => {
+test('manifest：dsh.client.inject 只许服务名 slots，不许写包名', () => {
   const inject = pkg.dsh?.client?.inject;
-  const empty = inject === undefined || (Array.isArray(inject) && inject.length === 0);
-  assert.ok(
-    empty,
-    `外部 bundle 等不到内置服务名，会卡在 "web boot: 1 entry did not activate"。当前值：${JSON.stringify(inject)}`,
+  assert.ok(Array.isArray(inject), 'dsh.client.inject 应当是数组（缺省时可不写）');
+  assert.deepEqual(
+    inject,
+    ['slots'],
+    `只注入确定存在的服务 slots。写包名（@deepseek-ai/...）会让 fiber 永远 pending。当前：${JSON.stringify(inject)}`,
   );
 });
 
-test('client.js：模块级 inject 是空数组', () => {
-  const match = clientSource.match(/const\s+inject\s*=\s*\[([^\]]*)\]/);
-  assert.ok(match, 'client.js 里找不到 `const inject = [...]`');
-  assert.equal(match[1].trim(), '', `client.js 的 inject 必须为空数组，当前：[${match[1]}]`);
+test('client.js：模块级 inject 是 ["slots"]', () => {
+  const match = clientSource.match(/var\s+inject\s*=\s*\[([^\]]*)\]/);
+  assert.ok(match, 'client.js 里找不到 `var inject = [...]`');
+  const names = match[1]
+    .split(',')
+    .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean);
+  assert.deepEqual(names, ['slots'], `client.js 的 inject 只能有 slots，当前：[${match[1]}]`);
 });
 
-test('client.js：不碰 ctx.slots / ctx.remote（这是 loading 事故的根因）', () => {
+test('client.js：槽名必须是 conversation.input.left', () => {
   assert.ok(
-    !/ctx\.slots/.test(clientCode),
-    'client.js 不得使用 ctx.slots：外部 bundle 注册槽会让 boot 卡在 loading',
+    /SLOT_NAME\s*=\s*['"]conversation\.input\.left['"]/.test(clientSource),
+    '槽名必须是 conversation.input.left（dsh-windows-mcp 已验证的那个座位）',
   );
+});
+
+test('client.js：不碰 ctx.remote（那条路没验证过，且会引入服务依赖）', () => {
   assert.ok(
     !/ctx\.remote/.test(clientCode),
-    'client.js 不得使用 ctx.remote：不声明 inject 时它不可用，声明 inject 又会 pending',
+    'client.js 不得使用 ctx.remote：状态走自家 /state 路由',
   );
 });
 
-test('client.js：require 只能是惰性、且只对本仓库已知的包', () => {
-  const requires = [...clientSource.matchAll(/require\(\s*'([^']+)'\s*\)/g)].map((m) => m[1]);
-  const allowed = new Set(['@deepseek-ai/dsh-api-remotes']);
+test('client.js：ctx.slots 只出现在 apply 里，且 apply 包了 try/catch', () => {
+  const applyAt = clientSource.indexOf('function apply(');
+  assert.ok(applyAt > 0, '找不到 function apply(');
+  const before = clientSource.slice(0, applyAt);
+  assert.ok(
+    !/ctx\.slots/.test(before),
+    'ctx.slots 不能出现在 apply 之外（模块加载期执行会让 entry 直接失败）',
+  );
+  assert.ok(/function apply\(ctx\)\s*\{\s*try/.test(clientSource), 'apply 应该以 try 开头');
+});
+
+test('client.js：require 只有 react', () => {
+  const requires = [...clientSource.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
+  const allowed = new Set(['react']);
   for (const name of requires) {
     assert.ok(allowed.has(name), `client.js 里出现了未预期的 require：${name}`);
   }
-  // 惰性：require 只能出现在 lazyCommands 里，不能出现在 apply 顶层
-  const applyBody = clientSource.slice(clientSource.indexOf('function apply('));
+});
+
+test('client.js：导出形态正确', () => {
   assert.ok(
-    !/require\(/.test(applyBody),
-    'apply 里不得同步 require：解析失败会直接让 entry 失败',
+    /module\.exports\s*=\s*\{\s*name:\s*PACKAGE_ID,\s*apply:\s*apply,\s*inject:\s*inject\s*\}/.test(clientSource),
+    '导出必须是 { name, apply, inject }',
   );
 });
 
-test('client.js：apply 整体包了 try/catch，且导出形态正确', () => {
-  assert.ok(/function apply\(ctx\)\s*\{\s*try/.test(clientSource), 'apply 应该以 try 开头');
+test('client.js：状态路由是自家路径，不借用别人的', () => {
   assert.ok(
-    /module\.exports\s*=\s*\{\s*name:\s*'dsh-goal-loop',\s*apply,\s*inject\s*\}/.test(clientSource),
-    '导出必须是 { name, apply, inject }',
+    /STATE_PATH\s*=\s*['"]\/dsh-goal-loop\/state['"]/.test(clientSource),
+    'STATE_PATH 必须是 /dsh-goal-loop/state',
   );
 });
 

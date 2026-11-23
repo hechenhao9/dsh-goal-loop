@@ -123,9 +123,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 ### 开关：入口在哪，怎么关
 
-**从 1.3.0 起，开关就在对话框里**：输入框那排（`完全权限`「AI 控制电脑」那一行）会出现一个「目标工程」chip。点一下切换，开着时 chip 亮起并写「目标工程」，关着时写「目标工程 · 关」。它显示的是宿主的真实状态，不是自己存的一份副本。
+**从 1.6.0 起，开关和「AI 控制电脑」坐在同一个座位**：`conversation.input.left`——输入框那排左侧。一个状态点 + 一个闸门图标 + 文案：开着写「目标工程」、点变绿；关着写「目标工程 · 关」、灰点；连不上宿主时橙点写「目标工程 · 连不上」，点一下重试。
 
-chip 走的通路是宿主的 `/goal-mode` 命令，三个入口共用一个状态：
+它不是自绘的假按钮：状态由宿主路由 `GET /dsh-goal-loop/state` 给出，点击 `POST {enabled}` 写回宿主内存与 `.goal/mode.json`，每 4 秒以及窗口重新聚焦时对齐一次，写失败自己回滚。与 `/goal-mode`、`goal_mode` 共用同一个开关：
 
 | 入口 | 说明 |
 |---|---|
@@ -216,15 +216,16 @@ command "goal" returned unknown result kind "prompt"
 
 命令名也必须匹配 `/^[a-z][a-z0-9_-]*$/u`（`goal-mode` 合法）。
 
-### 客户端 bundle 三条保命线
+### 客户端 bundle：只注入确定存在的服务
 
 DSH 的 boot 在结束前逐 entry 检查 `fiber.state === 2`（active），否则整页 `web boot: N entry did not activate`。所以客户端那一半：
 
-1. `const inject = []`——不声明任何服务依赖；
-2. **不碰 `ctx.slots` / `ctx.remote`**——槽注册返回的 Promise 若永不 resolve，entry 停在 `loading`，同样卡死 boot；
-3. `apply` 整体包 `try/catch`，只做纯 DOM（`MutationObserver` 找输入框、自己插按钮），最坏结果是按钮不出现。
+1. `var inject = ["slots"]`——**只能写服务名，不能写包名**。1.3.0 写的是 `@deepseek-ai/dsh-client-ui-conversation` 这类包名，cordis 等的是一个同名服务，永远等不到 → `pending`。`slots` 是确定存在的那个（本机 `dsh-windows-mcp` 也只注入它）；
+2. 槽用 `conversation.input.left`——本机已验证的座位，`ctx.slots.inject` 一定会 resolve；
+3. **不碰 `ctx.remote`**：状态走自家 HTTP 路由（`GET`/`POST /dsh-goal-loop/state`），不依赖命令目录刷新；
+4. `apply` 整体包 `try/catch`，**同步**返回 cleanup 函数（返回 Promise 会让 entry 卡 `loading`）。
 
-点击走 `document` 捕获阶段委托（React 重渲染会替换按钮行，绑在按钮自身的监听会丢）。
+不提供 `slots` 的环境里 fiber 会如实停在 `pending`——测试里专门有一条断言这件事，它就是 1.3.0 的失败形态。
 
 ### 出问题先看一个文件
 
