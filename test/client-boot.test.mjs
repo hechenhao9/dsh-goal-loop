@@ -53,8 +53,8 @@ function fakeReact() {
   };
 }
 
-function makeSandbox() {
-  const React = fakeReact();
+function makeSandbox(overrides = {}) {
+  const React = overrides.React ?? fakeReact();
   const head = { children: [], appendChild(n) { this.children.push(n); } };
   const document = {
     baseURI: 'http://127.0.0.1:1/',
@@ -70,7 +70,7 @@ function makeSandbox() {
     location: { pathname: '/', hash: '' },
     console: quiet,
     URL,
-    fetch: () => Promise.reject(new Error('no network in test')),
+    fetch: overrides.fetch ?? (() => Promise.reject(new Error('no network in test'))),
     setTimeout,
     clearInterval: () => {},
   };
@@ -196,4 +196,77 @@ test('client.js：真实 cordis 不提供 slots → 如实是 pending（证明�
   const fiber = ctx.plugin(mod);
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.equal(fiber.state, 0, '不提供 slots 时应当停在 pending(0)：这正是 1.3.0 的失败形态');
+});
+
+/**
+ * 兜底通道：宿主不把 webServer 暴露给插件时，`/state` 路由是 404，
+ * pill 必须还能用命令读到状态——否则插件「装了、看得见、点不动」。
+ */
+test('client.js：/state 打不通时，pill 用 /goal-mode status 读到状态', async () => {
+  const cells = [];
+  const statefulReact = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState: (initial) => {
+      const cell = { value: initial };
+      cells.push(cell);
+      return [
+        cell.value,
+        (next) => {
+          cell.value = typeof next === 'function' ? next(cell.value) : next;
+        },
+      ];
+    },
+    useRef: (initial) => ({ current: initial }),
+    useEffect: (fn) => {
+      try {
+        fn();
+      } catch (ignored) {
+        /* the poller is best-effort in this fake environment */
+      }
+    },
+    useCallback: (fn) => fn,
+  };
+  const commands = [];
+  const { mod } = makeSandbox({
+    React: statefulReact,
+    fetch: () => Promise.reject(new Error('404 no route')),
+  });
+  let Component = null;
+  let options = null;
+  mod.apply({
+    slots: {
+      inject: (_name, factory) => factory(),
+      register: (opts, C) => {
+        Component = C;
+        options = opts;
+        return () => {};
+      },
+    },
+    remote: {
+      commands: {
+        execute: (sessionId, line) => {
+          commands.push({ sessionId, line });
+          return Promise.resolve({ ok: true, value: { kind: 'success', text: '目标工程：开。交付类任务会先落合约。' } });
+        },
+      },
+    },
+  });
+  assert.ok(Component !== null, 'slot component 应当被注册');
+  assert.equal(typeof options.inject, 'function', 'slot 注册必须带 inject(sessionId)');
+  // 槽组件拿到的是 options.inject(sessionId) 的返回值；展开到 pill 真渲染。
+  let tree = Component(options.inject('s1'));
+  let guard = 0;
+  while (tree && typeof tree.type === 'function' && guard < 5) {
+    tree = tree.type(tree.props ?? {});
+    guard += 1;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(
+    commands.map((c) => c.line),
+    ['/goal-mode status'],
+    'fetch 失败后应当退到命令通道读状态',
+  );
+  const view = cells[0].value;
+  assert.equal(view.phase, 'ready', `命令读成功后不该停在 error，实际：${JSON.stringify(view)}`);
+  assert.equal(view.enabled, true, '文案里的「：开」必须被解析成开启');
 });

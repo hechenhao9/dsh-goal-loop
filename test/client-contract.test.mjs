@@ -41,14 +41,13 @@ test('manifest：dsh.client.platform 是 web', () => {
   assert.equal(pkg.dsh?.client?.platform, 'web');
 });
 
-test('manifest：dsh.client.inject 只许服务名 slots，不许写包名', () => {
-  const inject = pkg.dsh?.client?.inject;
-  assert.ok(Array.isArray(inject), 'dsh.client.inject 应当是数组（缺省时可不写）');
-  assert.deepEqual(
-    inject,
-    ['slots'],
-    `只注入确定存在的服务 slots。写包名（@deepseek-ai/...）会让 fiber 永远 pending。当前：${JSON.stringify(inject)}`,
-  );
+test('manifest：dsh.client 只写 platform，不写 inject（两个 inject 不是一回事）', () => {
+  // package.json 的 dsh.client.inject 是**模块依赖清单**（包名，dsh-client-modules 的
+  // graphRow 用它排加载顺序）；client.js 里的 `var inject = [...]` 才是 **cordis 服务依赖**。
+  // 本插件在 factory 里只 require 了 react（静态表提供），没有任何外部客户端模块依赖，
+  // 所以这里不该出现 inject。已跑通的 dsh-sidebar-fold 就是 `{platform:"web"}`。
+  assert.equal(pkg.dsh?.client?.inject, undefined, `dsh.client 不该带 inject，当前：${JSON.stringify(pkg.dsh?.client?.inject)}`);
+  assert.deepEqual(Object.keys(pkg.dsh.client), ['platform'], 'dsh.client 只该有 platform');
 });
 
 test('client.js：模块级 inject 是 ["slots"]', () => {
@@ -68,11 +67,19 @@ test('client.js：槽名必须是 conversation.input.left', () => {
   );
 });
 
-test('client.js：不碰 ctx.remote（那条路没验证过，且会引入服务依赖）', () => {
+test('client.js：ctx.remote 只做兜底，且必须在 try/catch 里惰性取', () => {
+  // 主路永远是自家 /state 路由；命令通道只在路由不通时兜底。
+  // 它绝不能进模块级 inject（那会让 fiber 等一个没人声明的服务，1.3.0 就是这么崩的）。
+  const at = clientSource.indexOf('function makeRunCommand(');
+  assert.ok(at > 0, '找不到 makeRunCommand：命令兜底必须收在一个函数里');
+  const body = clientSource.slice(at, clientSource.indexOf('\n    }', at));
+  assert.ok(/ctx\s*&&\s*ctx\.remote/.test(body), '取 ctx.remote 必须防 undefined');
+  assert.ok(/try\s*\{/.test(body), '取 ctx.remote 必须包 try：服务缺席时要安静降级');
   assert.ok(
-    !/ctx\.remote/.test(clientCode),
-    'client.js 不得使用 ctx.remote：状态走自家 /state 路由',
+    /typeof commands\.execute !== ['"]function['"]/.test(body),
+    '必须先确认 commands.execute 是函数再调用',
   );
+  assert.ok(!/inject[^\n]*remote/.test(clientSource), 'ctx.remote 的包名不许写进 inject');
 });
 
 test('client.js：ctx.slots 只出现在 apply 里，且 apply 包了 try/catch', () => {

@@ -154,8 +154,9 @@ function readSkill(file, fallbackDescription) {
 
 /** @param {object} ctx @param {string} key */
 function serviceOf(ctx, key) {
-  if (typeof ctx.get === 'function') return ctx.get(key);
-  return ctx[key];
+  const viaGet = typeof ctx?.get === 'function' ? ctx.get(key) : undefined;
+  if (viaGet !== undefined && viaGet !== null) return viaGet;
+  return ctx?.[key];
 }
 
 /**
@@ -220,8 +221,12 @@ function registerStateRoute(ctx, boot = () => {}) {
   try {
     ctx.inject(['webServer'], (scoped) => {
       try {
-        if (typeof scoped?.webServer?.register !== 'function') {
-          boot('route:missing');
+        // 两种取法都试：cordis 的服务既可能挂在 ctx 属性上，也可能只有 ctx.get。
+        // 早先只写 scoped.webServer，结果真实进程里拿不到 → route:missing（boot 日志有据）。
+        const server = serviceOf(scoped, 'webServer');
+        if (typeof server?.register !== 'function') {
+          const keys = scoped && typeof scoped === 'object' ? Object.keys(scoped).slice(0, 16).join(',') : typeof scoped;
+          boot('route:missing', `server=${typeof server} keys=${keys}`);
           return;
         }
 
@@ -282,7 +287,11 @@ function registerStateRoute(ctx, boot = () => {}) {
           request.on('error', () => respond(response, 400, { error: 'request failed' }));
         };
 
-        scoped.webServer.register({ kind: 'exact', path: STATE_ROUTE, handler });
+        // 官方写法是 webCtx.effect(() => register(...))：路由随这个 fiber 一起释放。
+        // effect 缺席时（测试桩）直接注册也能工作。
+        const install = () => server.register({ kind: 'exact', path: STATE_ROUTE, handler });
+        if (typeof scoped?.effect === 'function') scoped.effect(install, 'goal-loop:state-route');
+        else install();
         boot('route:ok', STATE_ROUTE);
       } catch (error) {
         boot('route:failed', String(error?.message ?? error));
