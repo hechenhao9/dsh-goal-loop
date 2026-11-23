@@ -12,6 +12,7 @@ import { apply } from '../index.mjs';
 function fakeCtx() {
   const tools = [];
   const services = {
+    tools: { register: (x) => tools.push(x) },
     skills: { register: () => {} },
     commands: { register: () => {} },
     systemPrompt: { section: () => () => {}, getSectionOrder: () => 10 },

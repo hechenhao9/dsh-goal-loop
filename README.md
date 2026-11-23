@@ -177,6 +177,72 @@ node bin/goal.mjs status                            # 台账总览
 
 ---
 
+## 五之二、为什么它不会再把 DSH 卡住（加载契约）
+
+这一节是三次真实事故换来的，写在这里是为了下次改代码别再踩。
+
+### 宿主侧：`inject` 必须是空的
+
+`export const inject = []`。
+
+cordis 会把插件的全部 `inject` 服务凑齐才让 fiber 进 `active`，凑不齐就一直 `pending`，`apply` 根本不执行。1.3.0 把两个**包名**当服务名写进 `inject`，结果 DSH 启动时报：
+
+```
+Error: web boot: 1 entry did not activate
+dsh-goal-loop: pending (waiting for services: @deepseek-ai/dsh-client-ui-conversation, @deepseek-ai/dsh-api-remotes)
+```
+
+正确姿势是 `inject` 留空，每个服务在 `apply` 里单独等：
+
+```js
+export const inject = [];
+export function apply(ctx, config = {}) {
+  if (on('policy')) ctx.inject(['systemPrompt'], (c) => { /* 缺它只少政策段 */ });
+  if (on('skills')) ctx.inject(['skills'], (c) => { /* 缺它只少 4 个技能 */ });
+  if (on('commands')) ctx.inject(['commands'], (c) => { /* 缺它只少 3 个命令 */ });
+  ctx.inject(['tools'], (c) => { /* 缺它只少 9 个工具 */ });
+}
+```
+
+缺哪个只少那一块功能，插件本身永远是 `active`。
+
+### 命令 handler 只能返回两种结果
+
+`dsh-commands` 的 `normalizeResult` 只认 `{kind:'success'|'error', text}`，其它一律抛：
+
+```
+command "goal" returned unknown result kind "prompt"
+```
+
+命令名也必须匹配 `/^[a-z][a-z0-9_-]*$/u`（`goal-mode` 合法）。
+
+### 客户端 bundle 三条保命线
+
+DSH 的 boot 在结束前逐 entry 检查 `fiber.state === 2`（active），否则整页 `web boot: N entry did not activate`。所以客户端那一半：
+
+1. `const inject = []`——不声明任何服务依赖；
+2. **不碰 `ctx.slots` / `ctx.remote`**——槽注册返回的 Promise 若永不 resolve，entry 停在 `loading`，同样卡死 boot；
+3. `apply` 整体包 `try/catch`，只做纯 DOM（`MutationObserver` 找输入框、自己插按钮），最坏结果是按钮不出现。
+
+点击走 `document` 捕获阶段委托（React 重渲染会替换按钮行，绑在按钮自身的监听会丢）。
+
+### 出问题先看一个文件
+
+```
+%TEMP%\dsh-goal-loop-boot.log
+```
+
+每行 `时间 pid 阶段`，阶段依次是 `module:loaded → apply:enter → skill:ok×4 → command:ok×3 → tools:ready → apply:exit`。对照读法：
+
+| 日志 | 含义 | 下一步 |
+|---|---|---|
+| 文件不存在 | 模块根本没被 import | 包没进 Loader，检查 profile `bundles` 与 junction |
+| 只有 `module:loaded` | `apply` 没执行 | fiber 卡在 pending，检查 `inject` |
+| 有 `command:failed <原因>` | 注册被拒 | 原因就在那一行 |
+| 一直到 `apply:exit` | 宿主侧全好 | 问题在前端（catalog 未刷新 / 选择器没命中） |
+
+---
+
 ## 六、一份合约长什么样
 
 纯工程任务（没有质量判断，只有能跑通/跑不通）：

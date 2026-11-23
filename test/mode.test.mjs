@@ -13,6 +13,7 @@ function fakeCtx() {
   const tools = [];
   const sections = [];
   const services = {
+    tools: { register: (x) => tools.push(x) },
     skills: { register: () => {} },
     commands: { register: () => {} },
     systemPrompt: {

@@ -15,6 +15,7 @@ function fakeCtx() {
   const commands = [];
   const sections = [];
   const services = {
+    tools: { register: (t) => tools.push(t) },
     skills: { register: (s) => skills.push(s) },
     commands: { register: (c) => commands.push(c) },
     systemPrompt: {
@@ -53,7 +54,8 @@ const RUBRIC = {
 
 test('入口导出形态正确', () => {
   assert.equal(name, 'dsh-goal-loop');
-  assert.deepEqual(inject, ['tools']);
+  // 依赖声明必须留空：fiber 一上来就 active，任何服务缺席都不能拖死整个插件
+  assert.deepEqual(inject, []);
   assert.equal(typeof apply, 'function');
 });
 
@@ -112,8 +114,7 @@ test('config.skills=false / commands=false 只影响对应层', () => {
 test('宿主没有 systemPrompt 服务时 apply 不抛，工具照常注册', () => {
   const tools = [];
   const ctx = {
-    tools: { register: (t) => tools.push(t) },
-    inject: (_names, cb) => cb({ get: () => undefined }),
+    inject: (_names, cb) => cb({ get: (k) => (k === 'tools' ? { register: (t) => tools.push(t) } : undefined) }),
     logger: { warn: () => {} },
   };
   assert.doesNotThrow(() => apply(ctx));

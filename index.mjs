@@ -34,7 +34,8 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync } from 'node:fs';
+import os from 'node:os';
 import {
   normalizeContract,
   validateContract,
@@ -93,7 +94,17 @@ import {
 export const name = 'dsh-goal-loop';
 
 /** 工具注册所需服务。 */
-export const inject = ['tools'];
+// 依赖声明留空：fiber 立刻 active，绝不因为某个服务缺席而让整个插件卡在 pending。
+// 每个服务在 apply 里用 ctx.inject([...], cb) 单独等——缺哪个只少那一块功能。
+export const inject = [];
+
+// 模块级回执：区分「模块根本没被 import」与「import 了但 apply 没执行」。
+// 查：%TEMP%\dsh-goal-loop-boot.log
+try {
+  appendFileSync(path.join(os.tmpdir(), 'dsh-goal-loop-boot.log'), new Date().toISOString() + ' pid=' + process.pid + ' module:loaded' + String.fromCharCode(10));
+} catch {
+  /* 写不进盘不影响加载 */
+}
 
 const SKILL_NAME = 'goal-loop';
 const SKILL_FILE = fileURLToPath(new URL('./skill/goal-loop.md', import.meta.url));
@@ -468,6 +479,19 @@ export function apply(ctx, config = {}) {
   const log = (msg) => ctx.logger?.warn?.(`dsh-goal-loop: ${msg}`);
   const on = (key) => config?.[key] !== false;
 
+  // 启动回执：宿主把 logger 写到用户看不到的地方，所以把「到底加载到哪一步」
+  // 落一个文件。查：%TEMP%\dsh-goal-loop-boot.log。
+  // 全包 try/catch——写不进盘绝不允许影响插件加载。
+  const bootPath = path.join(os.tmpdir(), 'dsh-goal-loop-boot.log');
+  const boot = (stage, detail) => {
+    try {
+      appendFileSync(bootPath, `${new Date().toISOString()} pid=${process.pid} ${stage}${detail ? ' ' + detail : ''}\n`);
+    } catch {
+      /* 写不进就算了，加载优先 */
+    }
+  };
+  boot('apply:enter', `config=${JSON.stringify(config)}`);
+
   // 0) 常驻政策段：三层闸门不靠"记得加载技能"，直接进系统提示。
   if (on('policy') && typeof ctx.inject === 'function') {
     ctx.inject(['systemPrompt'], (promptCtx) => {
@@ -500,7 +524,9 @@ export function apply(ctx, config = {}) {
       const register = (payload) => {
         try {
           skills.register(payload);
+          boot('skill:ok', payload.name);
         } catch (error) {
+          boot('skill:failed', `${payload.name} ${String(error)}`);
           log(`skill ${payload.name} 未注册：${String(error)}`);
         }
       };
@@ -546,7 +572,9 @@ export function apply(ctx, config = {}) {
       const add = (payload) => {
         try {
           commands.register(payload);
+          boot('command:ok', payload.name);
         } catch (error) {
+          boot('command:failed', `${payload.name} ${String(error)}`);
           log(`命令 ${payload.name} 注册失败：${String(error)}`);
         }
       };
@@ -557,7 +585,7 @@ export function apply(ctx, config = {}) {
         description: '进入目标工程：先说清交付什么，编译成双层合约，再动手；两层都过才算完成',
         input: { hint: '<你要交付的东西>', attachments: false },
         handler: () => ({
-          kind: 'prompt',
+          kind: 'success',
           text: [
             '按目标工程双层闸门处理下面这件事：先读 skill goal-loop。',
             '1) 用 goal_define 编译合约：objective / done_when / non_goals，判不了好坏的质量维度写进 rubric；',
@@ -575,7 +603,7 @@ export function apply(ctx, config = {}) {
         description: '对已完成的交付做独立评审：按 rubric 打分并交机器审计（引文逐字对、分数重算）',
         input: { hint: '<被评审的文件或目标 id>', attachments: false },
         handler: (input) => ({
-          kind: 'prompt',
+          kind: 'success',
           text: [
             `对「${String(input?.text ?? '').trim() || '当前交付物'}」做一次独立评审。`,
             '先读 skill goal-loop 与 skill goal-reviewer。',
@@ -612,8 +640,18 @@ export function apply(ctx, config = {}) {
     });
   }
 
+  // 3) 九个工具：工具服务单独等，缺它只少工具，不影响技能与命令
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['tools'], (toolCtx) => {
+      const tools = serviceOf(toolCtx, 'tools');
+      if (typeof tools?.register !== 'function') {
+        boot('tools:missing');
+        return;
+      }
+      boot('tools:ready');
+
   // 3) goal_define
-  ctx.tools.register({
+  tools.register({
     name: 'goal_define',
     description:
       '把需求编译成「双层目标合约」并落盘到 .goal/<id>/goal.json。done_when 是机器层（每条一个能真跑的命令）；rubric 是评审层（4–6 维、权重合计 100、每维有正反例、至少一条红线）。合约不合格会被拒收且不落盘——按 errors 补全后重调。这是目标工程的第一步：动手之前先让目标可验收。',
@@ -773,7 +811,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 4) goal_check
-  ctx.tools.register({
+  tools.register({
     name: 'goal_check',
     description:
       '真跑合约里的每条 check（机器层），落 .goal/<id>/proof-<n>.json，返回三态结论。green=true 只代表机器层全绿，不代表能交（有 rubric 时还要过评审层）。fail/unknown 时必须先修、再重跑。unknown 来自 manual 条目或执行异常，不计入绿灯。',
@@ -832,7 +870,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 5) goal_review
-  ctx.tools.register({
+  tools.register({
     name: 'goal_review',
     description:
       '提交一次独立判分并落 .goal/<id>/review-<n>.json。机器会审计这份判分：reviewer 不能是 self；每维分数只能是 0/4/7/10；每档必须附一句在被评审文件里逐字存在的原文（≥12 字，找不到即作废）；扣分的维度必须写出「把 X 改成 Y」；总分由机器按权重重算，不采信手报的数；命中红线直接不许交。审计不通过时按 errors 修判分再提交。',
@@ -960,7 +998,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 6) goal_predict —— 判分之前押注（盲预测）
-  ctx.tools.register({
+  tools.register({
     name: 'goal_predict',
     description:
       '判分之前押注：给 rubric 的每一维押一个分（0/4/7/10）、押一个总分区间、写清依据。落盘即封（sealed_at + 摘要），同一轮不可覆盖，判过分之后补预测会被拒收。它的用途是给「标准本身准不准」留一份对账凭据——没有预测，评审层过了 95 也只是一个数字。',
@@ -1029,7 +1067,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 7) goal_retro —— 判分之后对账
-  ctx.tools.register({
+  tools.register({
     name: 'goal_retro',
     description:
       '把盲预测与实际判分逐维对账：押了多少、实际多少、差多少、尺子偏高还是偏低、连续几轮同向。bias=over 表示标准把稿子想得比实际好（该收紧 criterion）；连续三轮同向＝改标准，不许再改稿。它不改分数、不改合约，只记账。',
@@ -1139,7 +1177,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 8) goal_verdict
-  ctx.tools.register({
+  tools.register({
     name: 'goal_verdict',
     description:
       '读盘上最近一次机器层结果（proof）与最近一次判分（review），给唯一裁决：deliverable=true 才允许汇报完成。机器层未全绿一定不能交；有 rubric 时评审层也必须过线且无红线。会落 .goal/<id>/gate.json 留痕。',
@@ -1214,7 +1252,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 9) goal_doctor：一次体检全部目标，直接给出下一步该敲哪个工具
-  ctx.tools.register({
+  tools.register({
     name: 'goal_doctor',
     description:
       '一次体检台账里所有目标：机器层红不红、判分有没有、判据换过没有、押注对账了没有、偏差是否连续同向、预算是否用满、代价台账与拒绝清单写没写，并把「下一步该敲哪个工具」直接给出来。不知道卡在哪，或者收工前想确认一遍，先跑它。',
@@ -1314,7 +1352,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 10) goal_status
-  ctx.tools.register({
+  tools.register({
     name: 'goal_status',
     description:
       '看目标台账：每个目标的 objective、状态、机器层最近一轮 pass/fail/unknown、评审层总分与合格线，以及目录路径。开工前用它确认"现在差哪几条"，汇报前用它确认"到底能不能交"。',
@@ -1418,7 +1456,7 @@ export function apply(ctx, config = {}) {
   });
 
   // 11) goal_mode：输入框那个开关的宿主侧落点（命令 /goal-mode 与它共享同一个状态）
-  ctx.tools.register({
+  tools.register({
     name: 'goal_mode',
     description:
       '读或改「目标工程模式」。打开时常驻闸门（三层闸门那段）进系统提示，交付类任务会先 goal_define；关掉后闸门撤出提示，但 9 个 goal_* 工具仍在。输入框那排的开关、/goal-mode 命令与这个工具是同一个状态。不带 enabled 就是查状态。',
@@ -1458,6 +1496,10 @@ export function apply(ctx, config = {}) {
       };
     },
   });
+
+      boot('apply:exit', 'tools=9');
+    });
+  }
 }
 
 /** @param {object|undefined} g */
